@@ -1,0 +1,7 @@
+person_type,id,date,start_time,end_time,site
+staff,S1,2025-09-04,08:00,17:00,Fort Wayne
+staff,S2,2025-09-04,09:00,17:00,Huntington
+staff,S3,2025-09-04,08:00,16:00,Fort Wayne
+client,C1,2025-09-04,08:30,15:00,Fort Wayne
+client,C2,2025-09-04,09:00,12:00,Huntington
+client,C3,2025-09-04,13:00,16:00,Fort Wayne
