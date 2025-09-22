@@ -552,24 +552,41 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         self._send_response(self._html_template('Upload Successful', body))
 
 
+def _initial_data_paths(filename: str):
+    """Yield potential CSV locations for bundled starter data."""
+    # Prefer files stored in the optional ``data`` subdirectory but fall back to
+    # CSVs located next to ``app.py``. The repository already ships sample
+    # ``staff.csv``, ``clients.csv`` and ``schedule.csv`` files in the project
+    # root, so checking both locations lets the application work out-of-the-box
+    # without any manual uploads.
+    yield os.path.join(BASE_DIR, 'data', filename)
+    yield os.path.join(BASE_DIR, filename)
+
+
 def run_server(port: int = 8000):
     """Initialize data from runtime snapshot and start the HTTP server."""
     load_runtime_state()
-    # Optionally pre‑load CSVs if present in the data directory
-    data_dir = os.path.join(BASE_DIR, 'data')
+    # Optionally pre-load CSVs if present in either the ``data`` directory or
+    # alongside this script. The first matching path wins so users can override
+    # the bundled examples by dropping replacement files into ``data/``.
     for category in ('staff', 'clients'):
-        csv_path = os.path.join(data_dir, f'{category}.csv')
-        if os.path.isfile(csv_path):
+        for csv_path in _initial_data_paths(f'{category}.csv'):
+            if not os.path.isfile(csv_path):
+                continue
             try:
                 load_csv(csv_path, category)
+                break
             except Exception:
-                pass
-    schedule_path = os.path.join(data_dir, 'schedule.csv')
-    if os.path.isfile(schedule_path):
+                # Try the next candidate file if parsing fails.
+                continue
+    for csv_path in _initial_data_paths('schedule.csv'):
+        if not os.path.isfile(csv_path):
+            continue
         try:
-            load_schedule_csv(schedule_path)
+            load_schedule_csv(csv_path)
+            break
         except Exception:
-            pass
+            continue
     server = HTTPServer(('0.0.0.0', port), SignInHTTPRequestHandler)
     print(f"Server starting on http://localhost:{port} ...")
     server.serve_forever()
