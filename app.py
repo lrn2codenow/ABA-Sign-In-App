@@ -527,7 +527,11 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST'})
         category = form.getvalue('category')
         fileitem = form['file'] if 'file' in form else None
-        if category not in ('staff', 'clients', 'schedule') or not fileitem or not fileitem.file:
+        if (
+            category not in ('staff', 'clients', 'schedule')
+            or fileitem is None
+            or getattr(fileitem, 'file', None) is None
+        ):
             self._send_response(self._html_template('Error', '<p class="text-danger">Invalid upload request.</p>'))
             return
         # Save the uploaded file to a temporary location
