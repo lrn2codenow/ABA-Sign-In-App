@@ -38,7 +38,6 @@ import json
 import os
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from io import BytesIO
 from urllib.parse import parse_qs
 import cgi
 
@@ -56,6 +55,28 @@ DATA = {
     'schedule': [], # list of {person_type, id, date, start_time, end_time, site}
     'signins': []   # list of {person_type, id, name, site, timestamp, action}
 }
+
+
+def _normalize_row(row):
+    """Return a mapping with lower-cased keys and trimmed string values.
+
+    ``csv.DictReader`` preserves the header names exactly as they appear in the
+    CSV file which means ``Name`` and ``name`` would produce different keys in
+    the resulting dictionaries. The application treats staff and client records
+    case-insensitively though, so we normalise keys to lower-case and strip
+    whitespace from the values. Blank values are converted to empty strings to
+    avoid ``AttributeError`` when ``strip`` would be called on ``None``.
+    """
+
+    cleaned = {}
+    for key, value in row.items():
+        if key is None:
+            continue
+        normalized_key = key.strip().lower()
+        if not normalized_key:
+            continue
+        cleaned[normalized_key] = value.strip() if isinstance(value, str) else ''
+    return cleaned
 
 
 def load_csv(file_path: str, category: str) -> None:
@@ -80,12 +101,12 @@ def load_csv(file_path: str, category: str) -> None:
     with open(file_path, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            key = row.get('id') or row.get('ID')
+            cleaned = _normalize_row(row)
+            key = cleaned.get('id')
             if not key:
+                # Skip blank lines or rows that do not identify a record.
                 continue
-            # Normalize keys to lower case for uniform access
-            record = {k.lower(): v.strip() for k, v in row.items()}
-            DATA[category][key] = record
+            DATA[category][key] = cleaned
 
 
 def load_schedule_csv(file_path: str) -> None:
@@ -107,12 +128,13 @@ def load_schedule_csv(file_path: str) -> None:
     with open(file_path, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            person_type = row.get('person_type', '').strip().lower()
-            pid = row.get('id', '').strip()
-            date_str = row.get('date', '').strip()
-            start_time = row.get('start_time', '').strip()
-            end_time = row.get('end_time', '').strip()
-            site = row.get('site', '').strip()
+            cleaned = _normalize_row(row)
+            person_type = cleaned.get('person_type', '')
+            pid = cleaned.get('id', '')
+            date_str = cleaned.get('date', '')
+            start_time = cleaned.get('start_time', '')
+            end_time = cleaned.get('end_time', '')
+            site = cleaned.get('site', '')
             if not (person_type and pid and date_str and start_time and end_time and site):
                 continue
             # Validate person type
@@ -524,7 +546,14 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
     def _handle_upload_csv(self):
         """Handle CSV uploads for staff, clients, and schedule."""
         # Parse the incoming form data. Use cgi.FieldStorage to support file upload.
-        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST'})
+        environ = {
+            'REQUEST_METHOD': 'POST',
+            'CONTENT_TYPE': self.headers.get('Content-Type', ''),
+        }
+        content_length = self.headers.get('Content-Length')
+        if content_length is not None:
+            environ['CONTENT_LENGTH'] = content_length
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=environ)
         category = form.getvalue('category')
         fileitem = form['file'] if 'file' in form else None
         if (
