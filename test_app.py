@@ -7,6 +7,8 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
+import urllib.error
 
 import app
 
@@ -27,6 +29,7 @@ class SignInServerTestCase(unittest.TestCase):
         app.DATA['clients'] = {}
         app.DATA['schedule'] = []
         app.DATA['signins'] = []
+        app.SETTINGS['teams_webhook_url'] = ''
         self.server = None
         self.server_thread = None
         self.port = None
@@ -228,6 +231,60 @@ client,c4,invalid,09:00,11:00,Fort Wayne
         # Missing client (c2) should list contact information.
         self.assertIn('Charlie Learner', html)
         self.assertIn('Parent Paul', html)
+
+    def test_emergency_page_preview_when_webhook_configured(self):
+        self._populate_sample_data()
+        app.SETTINGS['teams_webhook_url'] = 'https://example.com/webhook'
+        app.DATA['signins'] = [
+            {
+                'person_type': 'staff',
+                'id': 's1',
+                'name': 'Alice Therapist',
+                'site': 'Fort Wayne',
+                'timestamp': '09:00',
+                'action': 'sign_in',
+            }
+        ]
+        self._start_server()
+
+        status, _, payload = self._request('GET', '/emergency')
+        self.assertEqual(status, 200)
+        html = payload.decode('utf-8')
+        self.assertIn('Preview Teams message', html)
+        self.assertIn('Alice Therapist', html)
+
+    def test_format_emergency_markdown_includes_present_and_missing(self):
+        status = {
+            'date': '2030-01-01',
+            'present': [('Staff', 'Alice', 'Fort Wayne', '09:00')],
+            'missing': [('Client', 'Bobby', 'Fort Wayne', 'Parent Patty', '555-0101')],
+        }
+        markdown = app.format_emergency_markdown(status)
+        self.assertIn('**Emergency Roll Call - 2030-01-01**', markdown)
+        self.assertIn('- Staff: Alice @ Fort Wayne (since 09:00)', markdown)
+        self.assertIn('- Client: Bobby (Site: Fort Wayne; Contact: Parent Patty, 555-0101)', markdown)
+
+    def test_send_teams_notification_handles_errors(self):
+        status = {
+            'date': '2030-01-01',
+            'present': [],
+            'missing': [],
+        }
+        with mock.patch('urllib.request.urlopen', side_effect=urllib.error.URLError('network down')):
+            success, message = app.send_teams_notification('https://example.com/webhook', status)
+        self.assertFalse(success)
+        self.assertIn('Failed to send notification', message)
+
+    def test_notify_endpoint_uses_helper(self):
+        self._populate_sample_data()
+        app.SETTINGS['teams_webhook_url'] = 'https://example.com/webhook'
+        self._start_server()
+
+        with mock.patch('app.send_teams_notification', return_value=(True, 'ok')) as mocked:
+            status, _, payload = self._request('POST', '/notify_teams')
+        self.assertEqual(status, 200)
+        mocked.assert_called_once()
+        self.assertIn('Notification Sent', payload.decode('utf-8'))
 
     def test_upload_csv_replaces_data(self):
         self._populate_sample_data()

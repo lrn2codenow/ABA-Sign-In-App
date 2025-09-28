@@ -53,21 +53,50 @@ complicated infrastructure.
    Place these files in the `data/` folder or upload them via the
    **Load Data** page once the server is running.
 
-4. **Run the server** – From a terminal in the `aba_sign_in_app`
-   directory, execute:
+4. **Run the development server** – From a terminal in the
+   `aba_sign_in_app` directory, execute:
 
    ```bash
    python3 app.py
    ```
 
-   The server will start on port 8000 by default. You can specify a
-   different port by editing the call to `run_server()` at the bottom
-   of `app.py`.
+   The server will start on port 8000 by default and prints a message
+   such as `Server starting on http://localhost:8000 ...` when it is
+   ready. You can stop it with `Ctrl+C`. To bind to another port, edit
+   the `run_server()` call at the bottom of `app.py` or run the module
+   directly with a custom port, e.g. `python3 -m app 8080`.
 
 5. **Access the app** – Open a web browser and navigate to
    `http://localhost:8000`. Use the navigation bar to sign in
    individuals, load data, view the admin dashboard, or check the
    emergency roll‑call list.
+
+## Microsoft Teams emergency notifications
+
+The application can post an emergency roll call summary to a Microsoft
+Teams channel via an incoming webhook.
+
+1. **Create an incoming webhook in Teams.** Follow the Microsoft Teams
+   documentation to add the *Incoming Webhook* connector to the channel
+   you want to notify. Copy the HTTPS URL that Teams generates.
+2. **Configure the webhook in the app.** Open the **Load Data** page
+   and paste the URL into the *Teams Webhook URL* field. The value is
+   stored in `runtime/settings.json` so it persists across restarts.
+3. **Preview the message.** Visit the **Emergency** page. When a
+   webhook is configured, the page shows a live Markdown preview of the
+   payload that will be posted to Teams, including everyone marked as
+   present or missing.
+4. **Send the alert.** Click the *Send Teams Emergency Notification*
+   button. The server will format the current roll call status and
+   perform an HTTP `POST` to the webhook URL.
+5. **Verify delivery in Teams.** A successful call returns HTTP 200 or
+   202 from Microsoft. Any non-success response (for example, network
+   restrictions that return 403) is reported back to the UI so you can
+   retry from an environment with outbound access.
+
+Encourage staff to acknowledge the alert directly in Teams so that the
+channel thread becomes a quick headcount for both staff and their
+assigned clients.
 
 ## Extending the App
 
