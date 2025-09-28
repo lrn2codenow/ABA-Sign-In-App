@@ -34,8 +34,11 @@ with a proper database and authentication system.
 
 import csv
 import datetime
+import html
 import json
 import os
+import urllib.error
+import urllib.request
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
@@ -55,6 +58,13 @@ DATA = {
     'schedule': [], # list of {person_type, id, date, start_time, end_time, site}
     'signins': []   # list of {person_type, id, name, site, timestamp, action}
 }
+
+# Runtime settings such as configured webhooks
+SETTINGS = {
+    'teams_webhook_url': ''
+}
+
+SETTINGS_PATH = os.path.join(RUNTIME_DIR, 'settings.json')
 
 
 def _normalize_row(row):
@@ -183,6 +193,131 @@ def load_runtime_state() -> None:
         DATA['signins'] = []
 
 
+def save_settings() -> None:
+    """Persist runtime settings such as webhook URLs."""
+    try:
+        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(SETTINGS, f, indent=2)
+    except OSError:
+        # Failing to persist settings should not crash the app; configuration can
+        # simply be re-entered if the write fails.
+        pass
+
+
+def load_settings() -> None:
+    """Load runtime settings from disk if available."""
+    if not os.path.isfile(SETTINGS_PATH):
+        return
+    try:
+        with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    webhook = data.get('teams_webhook_url', '')
+    if isinstance(webhook, str):
+        SETTINGS['teams_webhook_url'] = webhook
+
+
+def build_emergency_status():
+    """Compile lists of present and missing individuals for today's schedule."""
+    today = datetime.date.today().isoformat()
+    last_actions = {}
+    for record in DATA['signins']:
+        last_actions[(record['person_type'], record['id'])] = record
+    scheduled_today = [s for s in DATA['schedule'] if s['date'] == today]
+    present = []
+    missing = []
+    for s in scheduled_today:
+        key = (s['person_type'], s['id'])
+        name = ''
+        contact_name = ''
+        contact_phone = ''
+        if s['person_type'] == 'staff':
+            person = DATA['staff'].get(s['id'])
+            name = person.get('name', s['id']) if person else s['id']
+            contact_name = person.get('contact_name', '') if person else ''
+            contact_phone = person.get('contact_phone', '') if person else ''
+        else:
+            person = DATA['clients'].get(s['id'])
+            name = person.get('name', s['id']) if person else s['id']
+            contact_name = person.get('contact_name', '') if person else ''
+            contact_phone = person.get('contact_phone', '') if person else ''
+        if key in last_actions and last_actions[key]['action'] == 'sign_in':
+            record = last_actions[key]
+            present.append((s['person_type'].title(), name, record['site'], record['timestamp']))
+        else:
+            missing.append((s['person_type'].title(), name, s['site'], contact_name, contact_phone))
+    return {
+        'date': today,
+        'present': present,
+        'missing': missing,
+    }
+
+
+def format_emergency_markdown(status):
+    """Return a Markdown string summarising the emergency roll-call status."""
+
+    lines = [
+        f"**Emergency Roll Call - {status['date']}**",
+        f"Present: {len(status['present'])}",
+        f"Missing: {len(status['missing'])}",
+        '',
+    ]
+
+    if status['present']:
+        lines.append('**Present**')
+        for ptype, name, site, timestamp in status['present']:
+            lines.append(f"- {ptype}: {name} @ {site} (since {timestamp})")
+        lines.append('')
+
+    if status['missing']:
+        lines.append('**Missing Individuals**')
+        for ptype, name, site, cname, cphone in status['missing']:
+            contact_details = ', '.join(filter(None, [cname, cphone]))
+            if contact_details:
+                lines.append(f"- {ptype}: {name} (Site: {site}; Contact: {contact_details})")
+            else:
+                lines.append(f"- {ptype}: {name} (Site: {site})")
+        lines.append('')
+    else:
+        lines.append('All scheduled individuals are accounted for.')
+        lines.append('')
+
+    lines.append('Please respond in Teams with your status and confirm the safety of your staff and clients.')
+    return '\n'.join(lines)
+
+
+def send_teams_notification(webhook, status):
+    """Send the emergency status to the Microsoft Teams webhook.
+
+    Returns a tuple ``(success, message)`` where ``success`` is ``True`` if the
+    message was delivered and ``False`` otherwise. ``message`` contains details
+    suitable for displaying to the end user.
+    """
+
+    if not webhook:
+        return False, 'No Microsoft Teams webhook configured.'
+
+    payload = json.dumps({'text': format_emergency_markdown(status)}).encode('utf-8')
+    request = urllib.request.Request(
+        webhook,
+        data=payload,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            # Teams webhooks normally return HTTP 200 or 202 for success.
+            if response.status >= 400:
+                return False, f'Teams webhook responded with HTTP {response.status} ({response.reason}).'
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        return False, f'Failed to send notification: {exc}'
+
+    return True, 'Notification sent to Microsoft Teams.'
+
+
 class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
     """Request handler for the sign‑in application.
 
@@ -220,6 +355,10 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._handle_sign_action()
         elif path == '/upload_csv':
             self._handle_upload_csv()
+        elif path == '/configure_teams':
+            self._handle_configure_teams()
+        elif path == '/notify_teams':
+            self._handle_notify_teams()
         else:
             self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
 
@@ -451,41 +590,38 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_emergency(self):
         """Serve the emergency page showing who's on site and who is missing."""
-        today = datetime.date.today().isoformat()
-        # Last action for each person
-        last_actions = {}
-        for record in DATA['signins']:
-            last_actions[(record['person_type'], record['id'])] = record
-        scheduled_today = [s for s in DATA['schedule'] if s['date'] == today]
-        present = []
-        missing = []
-        for s in scheduled_today:
-            key = (s['person_type'], s['id'])
-            record = None
-            name = ''
-            contact_name = ''
-            contact_phone = ''
-            if s['person_type'] == 'staff':
-                person = DATA['staff'].get(s['id'])
-                name = person.get('name', s['id']) if person else s['id']
-                contact_name = person.get('contact_name', '') if person else ''
-                contact_phone = person.get('contact_phone', '') if person else ''
-            else:
-                person = DATA['clients'].get(s['id'])
-                name = person.get('name', s['id']) if person else s['id']
-                contact_name = person.get('contact_name', '') if person else ''
-                contact_phone = person.get('contact_phone', '') if person else ''
-            if key in last_actions and last_actions[key]['action'] == 'sign_in':
-                record = last_actions[key]
-                present.append((s['person_type'].title(), name, record['site'], record['timestamp']))
-            else:
-                missing.append((s['person_type'].title(), name, s['site'], contact_name, contact_phone))
-        # Build tables
-        present_rows = ''.join([f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{time}</td></tr>' for (ptype, name, site, time) in present])
-        missing_rows = ''.join([f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{cname}</td><td>{cphone}</td></tr>' for (ptype, name, site, cname, cphone) in missing])
+        status = build_emergency_status()
+        present_rows = ''.join([
+            f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{time}</td></tr>'
+            for (ptype, name, site, time) in status['present']
+        ])
+        missing_rows = ''.join([
+            f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{cname}</td><td>{cphone}</td></tr>'
+            for (ptype, name, site, cname, cphone) in status['missing']
+        ])
+        if SETTINGS.get('teams_webhook_url'):
+            preview_markdown = format_emergency_markdown(status)
+            preview_html = html.escape(preview_markdown).replace('\n', '<br>')
+            teams_notice = (
+                "<form method=\"post\" action=\"/notify_teams\">"
+                "  <button type=\"submit\" class=\"btn btn-warning mb-3\">Send Teams Emergency Notification</button>"
+                "</form>"
+                "<p class=\"text-muted\">A notification will be posted to the configured Microsoft Teams channel.</p>"
+                "<details class=\"mb-3\">"
+                "  <summary>Preview Teams message</summary>"
+                f"  <div class=\"mt-2 p-3 bg-white border rounded\">{preview_html}</div>"
+                "</details>"
+            )
+        else:
+            teams_notice = (
+                "<div class=\"alert alert-info\" role=\"alert\">"
+                "Configure a Microsoft Teams webhook on the Load Data page to enable emergency notifications."
+                "</div>"
+            )
         body = f"""
 <h2>Emergency Roll Call</h2>
-<p>Date: {today}</p>
+<p>Date: {status['date']}</p>
+{teams_notice}
 <h3>Present on Site</h3>
 <table class="table table-success table-bordered">
   <thead><tr><th>Type</th><th>Name</th><th>Site</th><th>Signed In At</th></tr></thead>
@@ -505,7 +641,13 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def _serve_load_data_page(self):
         """Serve the page for uploading CSV files."""
-        body = """
+        webhook_status = 'Configured' if SETTINGS.get('teams_webhook_url') else 'Not Configured'
+        webhook_hint = (
+            f"<span class=\"badge bg-success\">{webhook_status}</span>"
+            if SETTINGS.get('teams_webhook_url')
+            else f"<span class=\"badge bg-secondary\">{webhook_status}</span>"
+        )
+        body = f"""
 <h2>Load Data</h2>
 <p>Use this page to upload CSV files for staff, clients, and schedules. The server will overwrite existing data in memory.</p>
 <div class="row">
@@ -538,6 +680,21 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
       </div>
       <button type="submit" class="btn btn-primary">Upload Schedule</button>
     </form>
+  </div>
+</div>
+<hr>
+<div class="row">
+  <div class="col-md-6">
+    <h4>Microsoft Teams Emergency Notifications {webhook_hint}</h4>
+    <p>Provide an incoming webhook URL from your Microsoft Teams channel to enable one-click emergency notifications.</p>
+    <form method="post" action="/configure_teams">
+      <div class="mb-3">
+        <label for="teams_webhook" class="form-label">Teams Webhook URL</label>
+        <input type="url" class="form-control" id="teams_webhook" name="webhook" placeholder="https://..." value="{SETTINGS.get('teams_webhook_url', '')}" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Save Webhook</button>
+    </form>
+    <p class="mt-2 text-muted">The URL is stored on this server only and used when sending an emergency notification.</p>
   </div>
 </div>
 """
@@ -584,6 +741,41 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         body = f'<div class="alert alert-success" role="alert">Successfully loaded {category} data.</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
         self._send_response(self._html_template('Upload Successful', body))
 
+    def _handle_configure_teams(self):
+        """Store the Microsoft Teams webhook URL provided by the admin."""
+        length = int(self.headers.get('Content-Length', 0))
+        payload = self.rfile.read(length).decode('utf-8') if length else ''
+        params = parse_qs(payload)
+        webhook = params.get('webhook', [''])[0].strip()
+        if not webhook:
+            body = '<p class="text-danger">No webhook URL provided.</p><a href="/load_data" class="btn btn-secondary">Back</a>'
+            self._send_response(self._html_template('Teams Configuration Error', body))
+            return
+        if not webhook.lower().startswith('https://'):
+            body = '<p class="text-danger">Webhook URLs must start with https://</p><a href="/load_data" class="btn btn-secondary">Back</a>'
+            self._send_response(self._html_template('Teams Configuration Error', body))
+            return
+        SETTINGS['teams_webhook_url'] = webhook
+        save_settings()
+        body = '<div class="alert alert-success" role="alert">Microsoft Teams webhook saved.</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
+        self._send_response(self._html_template('Teams Configuration Saved', body))
+
+    def _handle_notify_teams(self):
+        """Send an emergency notification to Microsoft Teams."""
+        webhook = SETTINGS.get('teams_webhook_url', '').strip()
+        if not webhook:
+            body = '<p class="text-danger">No Microsoft Teams webhook configured.</p><a href="/emergency" class="btn btn-secondary">Back</a>'
+            self._send_response(self._html_template('Notification Error', body))
+            return
+        status = build_emergency_status()
+        success, message = send_teams_notification(webhook, status)
+        if not success:
+            body = f'<p class="text-danger">{message}</p><a href="/emergency" class="btn btn-secondary">Back to Emergency</a>'
+            self._send_response(self._html_template('Notification Error', body))
+            return
+        body = f'<div class="alert alert-success" role="alert">{message}</div><a href="/emergency" class="btn btn-primary">Back to Emergency</a>'
+        self._send_response(self._html_template('Notification Sent', body))
+
 
 def _initial_data_paths(filename: str):
     """Yield potential CSV locations for bundled starter data."""
@@ -598,6 +790,7 @@ def _initial_data_paths(filename: str):
 
 def run_server(port: int = 8000):
     """Initialize data from runtime snapshot and start the HTTP server."""
+    load_settings()
     load_runtime_state()
     # Optionally pre-load CSVs if present in either the ``data`` directory or
     # alongside this script. The first matching path wins so users can override
