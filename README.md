@@ -62,9 +62,12 @@ complicated infrastructure.
 
    The server will start on port 8000 by default and prints a message
    such as `Server starting on http://localhost:8000 ...` when it is
-   ready. You can stop it with `Ctrl+C`. To bind to another port, edit
-   the `run_server()` call at the bottom of `app.py` or run the module
-   directly with a custom port, e.g. `python3 -m app 8080`.
+   ready. Keep the terminal session running so the process stays alive.
+   In containerised development environments this also ensures the
+   environment continues forwarding port 8000 to your browser. You can
+   stop the server at any time with `Ctrl+C`. To bind to another port,
+   edit the `run_server()` call at the bottom of `app.py` or run the
+   module directly with a custom port, e.g. `python3 -m app 8080`.
 
 5. **Access the app** – Open a web browser and navigate to
    `http://localhost:8000`. Use the navigation bar to sign in
