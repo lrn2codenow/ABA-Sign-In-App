@@ -230,12 +230,18 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
     reference bootstrap CSS via CDN for basic styling.
     """
 
-    def _send_response(self, content: bytes, content_type: str = 'text/html', status: HTTPStatus = HTTPStatus.OK):
+    def _send_response(
+        self,
+        content: bytes,
+        content_type: str = 'text/html',
+        status: HTTPStatus = HTTPStatus.OK,
+    ):
         self.send_response(status)
         self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(content)))
         self.end_headers()
-        self.wfile.write(content)
+        if self.command != 'HEAD':
+            self.wfile.write(content)
 
     def do_GET(self):
         path = self.path.split('?')[0]
@@ -264,6 +270,10 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._handle_notify_teams()
         else:
             self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
+
+    # Allow basic uptime/health checks that rely on HTTP HEAD requests.
+    def do_HEAD(self):  # pragma: no cover - simple delegation to GET logic
+        self.do_GET()
 
     # Static file serving (limited to CSS)
     def _serve_static(self, path: str):
