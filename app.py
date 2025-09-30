@@ -32,23 +32,34 @@ For a production system you would likely replace these structures
 with a proper database and authentication system.
 """
 
-import csv
 import datetime
 import html
-import json
 import os
-import urllib.error
-import urllib.request
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 import cgi
 
+from aba_enterprise import (
+    AppConfig,
+    AuditLogger,
+    CSVDataLoader,
+    EmergencyNotificationService,
+    ReportingService,
+    RuntimeSnapshotStore,
+    SettingsStore,
+    SignInService,
+    configure_logging,
+    load_app_config,
+)
+
 # Base directory of this script
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # Directory where runtime files (snapshots) are stored
-RUNTIME_DIR = os.path.join(BASE_DIR, 'runtime')
+APP_CONFIG: AppConfig = load_app_config(BASE_DIR)
+configure_logging(APP_CONFIG)
+RUNTIME_DIR = str(APP_CONFIG.runtime_dir)
 os.makedirs(RUNTIME_DIR, exist_ok=True)
 
 # Global in‑memory storage
@@ -64,29 +75,28 @@ SETTINGS = {
     'teams_webhook_url': ''
 }
 
-SETTINGS_PATH = os.path.join(RUNTIME_DIR, 'settings.json')
+DATA_LOADER = CSVDataLoader(DATA)
+REPORTING_SERVICE = ReportingService(DATA)
 
 
-def _normalize_row(row):
-    """Return a mapping with lower-cased keys and trimmed string values.
+def _snapshot_store() -> RuntimeSnapshotStore:
+    return RuntimeSnapshotStore(RUNTIME_DIR)
 
-    ``csv.DictReader`` preserves the header names exactly as they appear in the
-    CSV file which means ``Name`` and ``name`` would produce different keys in
-    the resulting dictionaries. The application treats staff and client records
-    case-insensitively though, so we normalise keys to lower-case and strip
-    whitespace from the values. Blank values are converted to empty strings to
-    avoid ``AttributeError`` when ``strip`` would be called on ``None``.
-    """
 
-    cleaned = {}
-    for key, value in row.items():
-        if key is None:
-            continue
-        normalized_key = key.strip().lower()
-        if not normalized_key:
-            continue
-        cleaned[normalized_key] = value.strip() if isinstance(value, str) else ''
-    return cleaned
+def _settings_store() -> SettingsStore:
+    return SettingsStore(RUNTIME_DIR)
+
+
+def _audit_logger() -> AuditLogger:
+    return AuditLogger(RUNTIME_DIR)
+
+
+def _sign_in_service() -> SignInService:
+    return SignInService(DATA, _snapshot_store(), _audit_logger(), APP_CONFIG)
+
+
+def _notification_service() -> EmergencyNotificationService:
+    return EmergencyNotificationService(APP_CONFIG)
 
 
 def load_csv(file_path: str, category: str) -> None:
@@ -107,16 +117,7 @@ def load_csv(file_path: str, category: str) -> None:
 
     This function clears any existing records in the selected category.
     """
-    DATA[category] = {}
-    with open(file_path, newline='', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            cleaned = _normalize_row(row)
-            key = cleaned.get('id')
-            if not key:
-                # Skip blank lines or rows that do not identify a record.
-                continue
-            DATA[category][key] = cleaned
+    DATA_LOADER.load_people(file_path, category)
 
 
 def load_schedule_csv(file_path: str) -> None:
@@ -134,38 +135,7 @@ def load_schedule_csv(file_path: str) -> None:
 
     Existing schedule entries are cleared when this function runs.
     """
-    DATA['schedule'] = []
-    with open(file_path, newline='', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            cleaned = _normalize_row(row)
-            person_type = cleaned.get('person_type', '')
-            pid = cleaned.get('id', '')
-            date_str = cleaned.get('date', '')
-            start_time = cleaned.get('start_time', '')
-            end_time = cleaned.get('end_time', '')
-            site = cleaned.get('site', '')
-            if not (person_type and pid and date_str and start_time and end_time and site):
-                continue
-            # Validate person type
-            if person_type not in ('staff', 'client'):
-                continue
-            # Validate date
-            try:
-                datetime.datetime.strptime(date_str, '%Y-%m-%d')
-            except ValueError:
-                continue
-            # Basic time validation
-            if len(start_time) < 4 or len(end_time) < 4:
-                continue
-            DATA['schedule'].append({
-                'person_type': person_type,
-                'id': pid,
-                'date': date_str,
-                'start_time': start_time,
-                'end_time': end_time,
-                'site': site
-            })
+    DATA_LOADER.load_schedule(file_path)
 
 
 def save_runtime_state() -> None:
@@ -175,29 +145,18 @@ def save_runtime_state() -> None:
     sign‑in records are stored in the runtime snapshot because staff,
     client, and schedule data are typically loaded from CSV files.
     """
-    snapshot_path = os.path.join(RUNTIME_DIR, 'signins.json')
-    with open(snapshot_path, 'w', encoding='utf-8') as f:
-        json.dump(DATA['signins'], f, indent=2)
+    _snapshot_store().save(DATA['signins'])
 
 
 def load_runtime_state() -> None:
     """Load sign‑in records from disk if they exist."""
-    snapshot_path = os.path.join(RUNTIME_DIR, 'signins.json')
-    if os.path.isfile(snapshot_path):
-        try:
-            with open(snapshot_path, 'r', encoding='utf-8') as f:
-                DATA['signins'] = json.load(f)
-        except Exception:
-            DATA['signins'] = []
-    else:
-        DATA['signins'] = []
+    DATA['signins'] = _snapshot_store().load()
 
 
 def save_settings() -> None:
     """Persist runtime settings such as webhook URLs."""
     try:
-        with open(SETTINGS_PATH, 'w', encoding='utf-8') as f:
-            json.dump(SETTINGS, f, indent=2)
+        _settings_store().save(SETTINGS)
     except OSError:
         # Failing to persist settings should not crash the app; configuration can
         # simply be re-entered if the write fails.
@@ -206,15 +165,7 @@ def save_settings() -> None:
 
 def load_settings() -> None:
     """Load runtime settings from disk if available."""
-    if not os.path.isfile(SETTINGS_PATH):
-        return
-    try:
-        with open(SETTINGS_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception:
-        return
-    if not isinstance(data, dict):
-        return
+    data = _settings_store().load()
     webhook = data.get('teams_webhook_url', '')
     if isinstance(webhook, str):
         SETTINGS['teams_webhook_url'] = webhook
@@ -222,38 +173,7 @@ def load_settings() -> None:
 
 def build_emergency_status():
     """Compile lists of present and missing individuals for today's schedule."""
-    today = datetime.date.today().isoformat()
-    last_actions = {}
-    for record in DATA['signins']:
-        last_actions[(record['person_type'], record['id'])] = record
-    scheduled_today = [s for s in DATA['schedule'] if s['date'] == today]
-    present = []
-    missing = []
-    for s in scheduled_today:
-        key = (s['person_type'], s['id'])
-        name = ''
-        contact_name = ''
-        contact_phone = ''
-        if s['person_type'] == 'staff':
-            person = DATA['staff'].get(s['id'])
-            name = person.get('name', s['id']) if person else s['id']
-            contact_name = person.get('contact_name', '') if person else ''
-            contact_phone = person.get('contact_phone', '') if person else ''
-        else:
-            person = DATA['clients'].get(s['id'])
-            name = person.get('name', s['id']) if person else s['id']
-            contact_name = person.get('contact_name', '') if person else ''
-            contact_phone = person.get('contact_phone', '') if person else ''
-        if key in last_actions and last_actions[key]['action'] == 'sign_in':
-            record = last_actions[key]
-            present.append((s['person_type'].title(), name, record['site'], record['timestamp']))
-        else:
-            missing.append((s['person_type'].title(), name, s['site'], contact_name, contact_phone))
-    return {
-        'date': today,
-        'present': present,
-        'missing': missing,
-    }
+    return REPORTING_SERVICE.build_emergency_status()
 
 
 def format_emergency_markdown(status):
@@ -297,25 +217,8 @@ def send_teams_notification(webhook, status):
     suitable for displaying to the end user.
     """
 
-    if not webhook:
-        return False, 'No Microsoft Teams webhook configured.'
-
-    payload = json.dumps({'text': format_emergency_markdown(status)}).encode('utf-8')
-    request = urllib.request.Request(
-        webhook,
-        data=payload,
-        headers={'Content-Type': 'application/json'},
-        method='POST',
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            # Teams webhooks normally return HTTP 200 or 202 for success.
-            if response.status >= 400:
-                return False, f'Teams webhook responded with HTTP {response.status} ({response.reason}).'
-    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-        return False, f'Failed to send notification: {exc}'
-
-    return True, 'Notification sent to Microsoft Teams.'
+    markdown = format_emergency_markdown(status)
+    return _notification_service().send(webhook, markdown)
 
 
 class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -496,6 +399,10 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             action_field = action_field[0]
         if isinstance(site_field, list):
             site_field = site_field[0]
+        if isinstance(action_field, str):
+            action_field = action_field.strip()
+        if isinstance(site_field, str):
+            site_field = site_field.strip()
         if not (person_field and action_field and site_field):
             self._send_response(self._html_template('Error', '<p class="text-danger">Invalid form submission.</p>'))
             return
@@ -505,56 +412,38 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_response(self._html_template('Error', '<p class="text-danger">Invalid person selected.</p>'))
             return
-        # Get name
-        record = DATA['staff'].get(pid) if ptype == 'staff' else DATA['clients'].get(pid)
-        name = record.get('name') if record else pid
-        timestamp = datetime.datetime.now().isoformat(timespec='seconds')
-        # Record the sign action
-        DATA['signins'].append({
-            'person_type': ptype,
-            'id': pid,
-            'name': name,
-            'site': site_field,
-            'timestamp': timestamp,
-            'action': action_field
-        })
-        save_runtime_state()
+        try:
+            event = _sign_in_service().record_action(
+                person_type=ptype,
+                person_id=pid,
+                action=action_field,
+                site=site_field,
+            )
+        except (KeyError, ValueError) as exc:
+            message = html.escape(str(exc))
+            body = f'<div class="alert alert-danger" role="alert">{message}</div><a href="/" class="btn btn-secondary">Return to Home</a>'
+            self._send_response(self._html_template('Error', body))
+            return
         # Response
-        message = f"Successfully recorded {action_field.replace('_', ' ').title()} for {name} at {timestamp}".replace('_', ' ')
-        body = f'<div class="alert alert-success" role="alert">{message}</div><a href="/" class="btn btn-primary">Return to Home</a>'
+        message = (
+            f"Successfully recorded {event['action'].replace('_', ' ').title()} for {html.escape(event['name'])} at {event['timestamp']}"
+        )
+        body = (
+            f'<div class="alert alert-success" role="alert">{message}</div><a href="/" class="btn btn-primary">Return to Home</a>'
+        )
         self._send_response(self._html_template('Submission Received', body))
 
     def _serve_admin(self):
         """Serve the admin dashboard with sign‑in history and schedule comparison."""
         today = datetime.date.today().isoformat()
-        # Determine current sign‑ins (last action per person)
-        last_actions = {}
-        for record in DATA['signins']:
-            last_actions[(record['person_type'], record['id'])] = record
-        current_on_site = [rec for rec in last_actions.values() if rec['action'] == 'sign_in']
-        # Determine scheduled persons for today
-        scheduled_today = [s for s in DATA['schedule'] if s['date'] == today]
-        # Build table of schedule vs sign‑in
-        rows = []
-        for s in scheduled_today:
-            key = (s['person_type'], s['id'])
-            status = 'Absent'
-            sign_time = ''
-            site = s['site']
-            name = ''
-            # Find person record
-            if s['person_type'] == 'staff':
-                rec = DATA['staff'].get(s['id'])
-                name = rec.get('name', s['id']) if rec else s['id']
-            else:
-                rec = DATA['clients'].get(s['id'])
-                name = rec.get('name', s['id']) if rec else s['id']
-            if key in last_actions and last_actions[key]['action'] == 'sign_in':
-                status = 'Present'
-                sign_time = last_actions[key]['timestamp']
-            rows.append((s['person_type'].title(), name, s['start_time'], s['end_time'], site, status, sign_time))
-        # HTML table rows
-        table_rows = ''.join([f'<tr><td>{ptype}</td><td>{name}</td><td>{start}</td><td>{end}</td><td>{site}</td><td>{status}</td><td>{stime}</td></tr>' for (ptype, name, start, end, site, status, stime) in rows])
+        rows = REPORTING_SERVICE.build_schedule_matrix(today)
+        table_rows = ''.join(
+            [
+                f"<tr><td>{row['person_type']}</td><td>{row['name']}</td><td>{row['start_time']}</td>"
+                f"<td>{row['end_time']}</td><td>{row['site']}</td><td>{row['status']}</td><td>{row['sign_time']}</td></tr>"
+                for row in rows
+            ]
+        )
         # Build sign-in history table rows separately to avoid quoting issues in f-string
         history_entries = []
         for rec in DATA['signins'][-20:][::-1]:
