@@ -46,6 +46,7 @@ from aba_enterprise import (
     AppConfig,
     AuditLogger,
     CSVDataLoader,
+    PersonAssignmentStore,
     EmergencyNotificationService,
     ReportingService,
     RuntimeSnapshotStore,
@@ -74,11 +75,13 @@ DATA = {
 
 # Runtime settings such as configured webhooks
 SETTINGS = {
-    'teams_webhook_url': ''
+    'teams_webhook_url': '',
+    'locations': [],
 }
 
 DATA_LOADER = CSVDataLoader(DATA)
 REPORTING_SERVICE = ReportingService(DATA)
+ASSIGNMENTS = {'staff': {}, 'clients': {}}
 
 
 FIRE_DRILL_REASON_OPTIONS = [
@@ -111,6 +114,59 @@ def _notification_service() -> EmergencyNotificationService:
     return EmergencyNotificationService(APP_CONFIG)
 
 
+def _fire_drill_dir() -> str:
+    path = os.path.join(RUNTIME_DIR, 'fire_drills')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _assignment_store() -> PersonAssignmentStore:
+    return PersonAssignmentStore(RUNTIME_DIR)
+
+
+def _configured_locations():
+    locations = SETTINGS.get('locations', [])
+    if not isinstance(locations, list):
+        return []
+    seen = set()
+    result = []
+    for entry in locations:
+        if not isinstance(entry, str):
+            continue
+        text = entry.strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def apply_assignments() -> None:
+    for category in ('staff', 'clients'):
+        overrides = ASSIGNMENTS.get(category, {})
+        records = DATA.get(category, {})
+        if not isinstance(overrides, dict) or not isinstance(records, dict):
+            continue
+        for pid, site in overrides.items():
+            if pid not in records or not isinstance(site, str):
+                continue
+            records[pid]['site'] = site
+
+
+def load_assignments() -> None:
+    global ASSIGNMENTS
+    ASSIGNMENTS = _assignment_store().load()
+    apply_assignments()
+
+
+def save_assignments() -> None:
+    try:
+        _assignment_store().save(ASSIGNMENTS)
+    except OSError:
+        pass
+
+
 def load_csv(file_path: str, category: str) -> None:
     """Load staff or client data from a CSV file.
 
@@ -130,6 +186,7 @@ def load_csv(file_path: str, category: str) -> None:
     This function clears any existing records in the selected category.
     """
     DATA_LOADER.load_people(file_path, category)
+    apply_assignments()
 
 
 def load_schedule_csv(file_path: str) -> None:
@@ -181,11 +238,51 @@ def load_settings() -> None:
     webhook = data.get('teams_webhook_url', '')
     if isinstance(webhook, str):
         SETTINGS['teams_webhook_url'] = webhook
+    locations = data.get('locations', [])
+    if isinstance(locations, list):
+        cleaned = []
+        seen = set()
+        for entry in locations:
+            if not isinstance(entry, str):
+                continue
+            text = entry.strip()
+            key = text.lower()
+            if not text or key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(text)
+        SETTINGS['locations'] = cleaned
+    else:
+        SETTINGS['locations'] = []
 
 
 def build_emergency_status():
     """Compile lists of present and missing individuals for today's schedule."""
     return REPORTING_SERVICE.build_emergency_status()
+
+
+def list_fire_drill_reports():
+    """Return metadata for previously generated fire drill reports."""
+
+    reports = []
+    directory = _fire_drill_dir()
+    try:
+        filenames = os.listdir(directory)
+    except OSError:
+        return []
+    for name in filenames:
+        if not name.lower().endswith('.csv'):
+            continue
+        path = os.path.join(directory, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            modified = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+        except OSError:
+            modified = None
+        reports.append({'filename': name, 'path': path, 'generated': modified})
+    reports.sort(key=lambda item: item['generated'] or datetime.datetime.min, reverse=True)
+    return reports
 
 
 def format_emergency_markdown(status):
@@ -281,6 +378,9 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._serve_firedrill_report_form()
         elif path == '/load_data':
             self._serve_load_data_page()
+        elif path.startswith('/admin/fire_drill_reports/'):
+            filename = path[len('/admin/fire_drill_reports/'):]
+            self._serve_fire_drill_report_download(filename)
         elif path.startswith('/static/'):
             self._serve_static(path)
         else:
@@ -298,6 +398,10 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._handle_notify_teams()
         elif path == '/firedrill_report':
             self._handle_firedrill_report_submission()
+        elif path == '/admin/locations':
+            self._handle_location_update()
+        elif path == '/admin/update_assignment':
+            self._handle_assignment_update()
         else:
             self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
 
@@ -317,9 +421,21 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         self._send_response(content, content_type)
 
     # Page templates
-    def _html_template(self, title: str, body: str) -> bytes:
+    def _html_template(self, title: str, body: str, *, include_admin_nav: bool = True) -> bytes:
         """Wrap the provided body in a simple HTML document."""
-        html = f"""
+
+        nav_links = [('/', 'Home')]
+        if include_admin_nav:
+            nav_links.extend([
+                ('/admin', 'Admin'),
+                ('/emergency', 'Emergency'),
+                ('/load_data', 'Load Data'),
+            ])
+        nav_items = ''.join(
+            f'<li class="nav-item"><a class="nav-link" href="{href}">{label}</a></li>'
+            for href, label in nav_links
+        )
+        html_doc = f"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -337,10 +453,7 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
     </button>
     <div class="collapse navbar-collapse" id="navbarNav">
       <ul class="navbar-nav">
-        <li class="nav-item"><a class="nav-link" href="/">Home</a></li>
-        <li class="nav-item"><a class="nav-link" href="/admin">Admin</a></li>
-        <li class="nav-item"><a class="nav-link" href="/emergency">Emergency</a></li>
-        <li class="nav-item"><a class="nav-link" href="/load_data">Load Data</a></li>
+        {nav_items}
       </ul>
     </div>
   </div>
@@ -351,13 +464,20 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
 </body>
 </html>
 """
-        return html.encode('utf-8')
+        return html_doc.encode('utf-8')
 
     def _serve_home(self):
         """Serve the home page with sign‑in/out forms."""
         # Build options for staff and clients
         staff_options = ''.join([f'<option value="staff|{sid}">{rec.get("name", "")}</option>' for sid, rec in DATA['staff'].items()])
         client_options = ''.join([f'<option value="client|{cid}">{rec.get("name", "")}</option>' for cid, rec in DATA['clients'].items()])
+        locations = _configured_locations()
+        datalist_id = 'site_options'
+        datalist_attr = f' list="{datalist_id}"' if locations else ''
+        datalist_html = ''
+        if locations:
+            options = ''.join(f'<option value="{html.escape(loc)}"></option>' for loc in locations)
+            datalist_html = f'<datalist id="{datalist_id}">{options}</datalist>'
         body = f"""
 <div class="row">
   <div class="col-md-6">
@@ -383,7 +503,7 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
       </div>
       <div class="mb-3">
         <label for="staff_site" class="form-label">Site</label>
-        <input type="text" class="form-control" id="staff_site" name="site" placeholder="e.g. Fort Wayne" required>
+        <input type="text" class="form-control" id="staff_site" name="site" placeholder="Enter assigned location"{datalist_attr} required>
       </div>
       <button type="submit" class="btn btn-primary">Submit</button>
     </form>
@@ -411,14 +531,15 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
       </div>
       <div class="mb-3">
         <label for="client_site" class="form-label">Site</label>
-        <input type="text" class="form-control" id="client_site" name="site" placeholder="e.g. Fort Wayne" required>
+        <input type="text" class="form-control" id="client_site" name="site" placeholder="Enter assigned location"{datalist_attr} required>
       </div>
       <button type="submit" class="btn btn-primary">Submit</button>
     </form>
   </div>
 </div>
+{datalist_html}
 """
-        self._send_response(self._html_template('Home - ABA Sign In', body))
+        self._send_response(self._html_template('Home - ABA Sign In', body, include_admin_nav=False))
 
     def _handle_sign_action(self):
         """Process a sign‑in or sign‑out form submission."""
@@ -444,13 +565,25 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         if isinstance(site_field, str):
             site_field = site_field.strip()
         if not (person_field and action_field and site_field):
-            self._send_response(self._html_template('Error', '<p class="text-danger">Invalid form submission.</p>'))
+            self._send_response(
+                self._html_template(
+                    'Error',
+                    '<p class="text-danger">Invalid form submission.</p>',
+                    include_admin_nav=False,
+                )
+            )
             return
         # person_field is of the form "type|id"
         try:
             ptype, pid = person_field.split('|')
         except ValueError:
-            self._send_response(self._html_template('Error', '<p class="text-danger">Invalid person selected.</p>'))
+            self._send_response(
+                self._html_template(
+                    'Error',
+                    '<p class="text-danger">Invalid person selected.</p>',
+                    include_admin_nav=False,
+                )
+            )
             return
         try:
             event = _sign_in_service().record_action(
@@ -462,7 +595,7 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         except (KeyError, ValueError) as exc:
             message = html.escape(str(exc))
             body = f'<div class="alert alert-danger" role="alert">{message}</div><a href="/" class="btn btn-secondary">Return to Home</a>'
-            self._send_response(self._html_template('Error', body))
+            self._send_response(self._html_template('Error', body, include_admin_nav=False))
             return
         # Response
         message = (
@@ -471,7 +604,9 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         body = (
             f'<div class="alert alert-success" role="alert">{message}</div><a href="/" class="btn btn-primary">Return to Home</a>'
         )
-        self._send_response(self._html_template('Submission Received', body))
+        self._send_response(
+            self._html_template('Submission Received', body, include_admin_nav=False)
+        )
 
     def _serve_admin(self):
         """Serve the admin dashboard with sign‑in history and schedule comparison."""
@@ -493,11 +628,169 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
                 f"<tr><td>{rec['timestamp']}</td><td>{rec['person_type'].title()}</td><td>{rec['name']}</td><td>{rec['site']}</td><td>{action_str}</td></tr>"
             )
         history_rows = ''.join(history_entries)
+        locations = _configured_locations()
+        location_list_items = ''.join(
+            [
+                "<li class=\"list-group-item d-flex justify-content-between align-items-center\">"
+                f"{html.escape(loc)}"
+                "<form method=\"post\" action=\"/admin/locations\" class=\"ms-3\">"
+                "  <input type=\"hidden\" name=\"action\" value=\"delete\">"
+                f"  <input type=\"hidden\" name=\"location\" value=\"{html.escape(loc)}\">"
+                "  <button type=\"submit\" class=\"btn btn-outline-danger btn-sm\">Remove</button>"
+                "</form>"
+                "</li>"
+                for loc in locations
+            ]
+        ) or '<li class="list-group-item">No locations configured.</li>'
+        census = REPORTING_SERVICE.build_site_census(locations)
+        census_rows = ''.join(
+            [
+                "<tr>"
+                f"<td>{html.escape(row['site'])}</td>"
+                f"<td>{row['staff_present']}</td>"
+                f"<td>{row['clients_present']}</td>"
+                f"<td>{row['total_present']}</td>"
+                "</tr>"
+                for row in census
+            ]
+        ) or '<tr><td colspan="4">No attendance recorded yet.</td></tr>'
+        reports = list_fire_drill_reports()
+        report_rows = ''.join(
+            [
+                "<tr>"
+                f"<td><a href=\"/admin/fire_drill_reports/{html.escape(report['filename'])}\">{html.escape(report['filename'])}</a></td>"
+                f"<td>{report['generated'].strftime('%Y-%m-%d %H:%M') if report['generated'] else 'Unknown'}</td>"
+                "</tr>"
+                for report in reports
+            ]
+        ) or '<tr><td colspan="2">No fire drill reports have been generated yet.</td></tr>'
+        assignment_input_attr = ' list="assignment_locations"' if locations else ''
+        assignment_datalist = ''
+        if locations:
+            datalist_options = ''.join(
+                f'<option value="{html.escape(loc)}"></option>' for loc in locations
+            )
+            assignment_datalist = f'<datalist id="assignment_locations">{datalist_options}</datalist>'
+        staff_options = ''.join(
+            [
+                f"<option value=\"{html.escape(sid)}\">{html.escape(str(rec.get('name', sid)))}" +
+                (f" — {html.escape(rec.get('site', ''))}" if rec.get('site') else '') +
+                "</option>"
+                for sid, rec in sorted(
+                    DATA['staff'].items(), key=lambda item: str(item[1].get('name', item[0])).lower()
+                )
+            ]
+        )
+        client_options = ''.join(
+            [
+                f"<option value=\"{html.escape(cid)}\">{html.escape(str(rec.get('name', cid)))}" +
+                (f" — {html.escape(rec.get('site', ''))}" if rec.get('site') else '') +
+                "</option>"
+                for cid, rec in sorted(
+                    DATA['clients'].items(), key=lambda item: str(item[1].get('name', item[0])).lower()
+                )
+            ]
+        )
+        staff_form = (
+            f"""
+<form class=\"row g-2 align-items-end\" method=\"post\" action=\"/admin/update_assignment\">
+  <input type=\"hidden\" name=\"category\" value=\"staff\">
+  <div class=\"col-md-5\">
+    <label class=\"form-label\" for=\"staff_assignment_person\">Select staff</label>
+    <select class=\"form-select\" id=\"staff_assignment_person\" name=\"person_id\" required>
+      <option value=\"\">-- Choose staff --</option>
+      {staff_options}
+    </select>
+  </div>
+  <div class=\"col-md-4\">
+    <label class=\"form-label\" for=\"staff_assignment_location\">Location</label>
+    <input type=\"text\" class=\"form-control\" id=\"staff_assignment_location\" name=\"location\" placeholder=\"Enter or select location\"{assignment_input_attr}>
+    <div class=\"form-text\">Leave blank to clear an override.</div>
+  </div>
+  <div class=\"col-md-3\">
+    <button type=\"submit\" class=\"btn btn-outline-primary w-100\">Update</button>
+  </div>
+</form>
+"""
+            if DATA['staff']
+            else '<p class="text-muted">Load staff data to manage assignments.</p>'
+        )
+        client_form = (
+            f"""
+<form class=\"row g-2 align-items-end\" method=\"post\" action=\"/admin/update_assignment\">
+  <input type=\"hidden\" name=\"category\" value=\"clients\">
+  <div class=\"col-md-5\">
+    <label class=\"form-label\" for=\"client_assignment_person\">Select client</label>
+    <select class=\"form-select\" id=\"client_assignment_person\" name=\"person_id\" required>
+      <option value=\"\">-- Choose client --</option>
+      {client_options}
+    </select>
+  </div>
+  <div class=\"col-md-4\">
+    <label class=\"form-label\" for=\"client_assignment_location\">Location</label>
+    <input type=\"text\" class=\"form-control\" id=\"client_assignment_location\" name=\"location\" placeholder=\"Enter or select location\"{assignment_input_attr}>
+    <div class=\"form-text\">Leave blank to clear an override.</div>
+  </div>
+  <div class=\"col-md-3\">
+    <button type=\"submit\" class=\"btn btn-outline-primary w-100\">Update</button>
+  </div>
+</form>
+"""
+            if DATA['clients']
+            else '<p class="text-muted">Load client data to manage assignments.</p>'
+        )
         body = f"""
 <h2>Admin Dashboard</h2>
 <p>Today is {today}</p>
+
+<div class=\"mb-4\">
+  <h3>Deployment &amp; Locations</h3>
+  <p class=\"text-muted\">Add or remove sites where this app is deployed.</p>
+  <form class=\"row g-2\" method=\"post\" action=\"/admin/locations\">
+    <input type=\"hidden\" name=\"action\" value=\"add\">
+    <div class=\"col-sm-8\">
+      <input type=\"text\" class=\"form-control\" name=\"location\" placeholder=\"New location name\" required>
+    </div>
+    <div class=\"col-sm-4\">
+      <button type=\"submit\" class=\"btn btn-primary w-100\">Add Location</button>
+    </div>
+  </form>
+  <ul class=\"list-group mt-3\">
+    {location_list_items}
+  </ul>
+</div>
+
+<div class=\"mb-4\">
+  <h3>Current Census by Location</h3>
+  <table class=\"table table-hover\">
+    <thead><tr><th>Location</th><th>Staff Present</th><th>Clients Present</th><th>Total Present</th></tr></thead>
+    <tbody>
+      {census_rows}
+    </tbody>
+  </table>
+</div>
+
+<div class=\"mb-4\">
+  <h3>Manage Assignments</h3>
+  <p class=\"text-muted\">Update which building staff and clients are assigned to.</p>
+  {staff_form}
+  <hr class=\"my-4\">
+  {client_form}
+  {assignment_datalist}
+</div>
+
+<div class=\"mb-4\">
+  <h3>Fire Drill Reports</h3>
+  <table class=\"table table-striped\">
+    <thead><tr><th>Report</th><th>Generated</th></tr></thead>
+    <tbody>
+      {report_rows}
+    </tbody>
+  </table>
+</div>
+
 <h3>Schedule vs Attendance</h3>
-<table class="table table-striped">
+<table class=\"table table-striped\">
   <thead>
     <tr><th>Type</th><th>Name</th><th>Start</th><th>End</th><th>Site</th><th>Status</th><th>Sign Time</th></tr>
   </thead>
@@ -506,7 +799,7 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
   </tbody>
 </table>
 <h3>Sign‑In History (latest 20 entries)</h3>
-<table class="table table-bordered">
+<table class=\"table table-bordered\">
   <thead>
     <tr><th>Timestamp</th><th>Type</th><th>Name</th><th>Site</th><th>Action</th></tr>
   </thead>
@@ -715,12 +1008,121 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         safe_location = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in location.strip()) or 'location'
         timestamp_component = drill_dt.strftime('%Y%m%d-%H%M')
         filename = f"firedrill_{timestamp_component}_{safe_location}.csv"
+        report_dir = _fire_drill_dir()
+        report_path = os.path.join(report_dir, filename)
+        try:
+            with open(report_path, 'wb') as handle:
+                handle.write(csv_data)
+        except OSError:
+            # Continue serving the download even if persistence fails.
+            pass
         self.send_response(HTTPStatus.OK)
         self.send_header('Content-Type', 'text/csv; charset=utf-8')
         self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
         self.send_header('Content-Length', str(len(csv_data)))
         self.end_headers()
         self.wfile.write(csv_data)
+
+    def _serve_fire_drill_report_download(self, filename: str) -> None:
+        safe_name = os.path.basename(filename)
+        if not safe_name:
+            self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
+            return
+        report_path = os.path.join(_fire_drill_dir(), safe_name)
+        if not os.path.isfile(report_path):
+            self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
+            return
+        try:
+            with open(report_path, 'rb') as handle:
+                data = handle.read()
+        except OSError:
+            self._send_response(b'Unable to read report', 'text/plain', HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', 'text/csv; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Content-Disposition', f'attachment; filename="{safe_name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_location_update(self) -> None:
+        length = int(self.headers.get('Content-Length', 0))
+        payload = self.rfile.read(length).decode('utf-8') if length else ''
+        params = parse_qs(payload)
+        action = params.get('action', ['add'])[0].strip().lower()
+        location = params.get('location', [''])[0].strip()
+        if not location:
+            body = '<p class="text-danger">Location name is required.</p><a href="/admin" class="btn btn-secondary">Back to Admin</a>'
+            self._send_response(self._html_template('Location Update Error', body))
+            return
+        existing = _configured_locations()
+        changed = False
+        message: str
+        if action == 'delete':
+            updated = [loc for loc in existing if loc.lower() != location.lower()]
+            if len(updated) == len(existing):
+                message = f'Location {html.escape(location)} was not found.'
+            else:
+                message = f'Removed location {html.escape(location)}.'
+                existing = updated
+                changed = True
+        else:
+            if any(loc.lower() == location.lower() for loc in existing):
+                message = f'Location {html.escape(location)} already exists.'
+            else:
+                existing.append(location)
+                message = f'Added location {html.escape(location)}.'
+                changed = True
+        existing = sorted(existing, key=str.lower)
+        SETTINGS['locations'] = existing
+        if changed:
+            save_settings()
+            alert_class = 'alert-success'
+        else:
+            alert_class = 'alert-info'
+        body = (
+            f'<div class="alert {alert_class}" role="alert">{message}</div>'
+            '<a href="/admin" class="btn btn-primary">Back to Admin</a>'
+        )
+        self._send_response(self._html_template('Locations Updated', body))
+
+    def _handle_assignment_update(self) -> None:
+        length = int(self.headers.get('Content-Length', 0))
+        payload = self.rfile.read(length).decode('utf-8') if length else ''
+        params = parse_qs(payload)
+        category = params.get('category', [''])[0]
+        person_id = params.get('person_id', [''])[0]
+        location = params.get('location', [''])[0].strip()
+        if category not in ('staff', 'clients'):
+            body = '<p class="text-danger">Invalid assignment category.</p><a href="/admin" class="btn btn-secondary">Back to Admin</a>'
+            self._send_response(self._html_template('Assignment Error', body))
+            return
+        records = DATA.get(category, {})
+        if not isinstance(records, dict) or person_id not in records:
+            body = '<p class="text-danger">Selected person could not be found.</p><a href="/admin" class="btn btn-secondary">Back to Admin</a>'
+            self._send_response(self._html_template('Assignment Error', body))
+            return
+        record = records[person_id]
+        record['site'] = location
+        ASSIGNMENTS.setdefault(category, {})[person_id] = location
+        save_assignments()
+        message = (
+            f'Assigned {html.escape(record.get("name", person_id))} to {html.escape(location)}.'
+            if location
+            else f'Cleared building assignment for {html.escape(record.get("name", person_id))}.'
+        )
+        if location:
+            existing = _configured_locations()
+            if not any(loc.lower() == location.lower() for loc in existing):
+                existing.append(location)
+                SETTINGS['locations'] = sorted(existing, key=str.lower)
+                save_settings()
+        self._send_response(
+            self._html_template(
+                'Assignment Updated',
+                f'<div class="alert alert-success" role="alert">{message}</div><a href="/admin" class="btn btn-primary">Back to Admin</a>',
+            )
+        )
 
     def _serve_load_data_page(self):
         """Serve the page for uploading CSV files."""
@@ -874,6 +1276,7 @@ def _initial_data_paths(filename: str):
 def run_server(port: int = 8000):
     """Initialize data from runtime snapshot and start the HTTP server."""
     load_settings()
+    load_assignments()
     load_runtime_state()
     # Optionally pre-load CSVs if present in either the ``data`` directory or
     # alongside this script. The first matching path wins so users can override

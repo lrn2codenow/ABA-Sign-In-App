@@ -154,6 +154,42 @@ class ReportingService:
                 )
         return {"date": today, "present": present, "missing": missing}
 
+    def build_site_census(self, known_locations: Optional[List[str]] = None) -> List[Dict[str, object]]:
+        """Summarise how many staff and clients are present at each site."""
+
+        actions = self.last_actions()
+        census: Dict[str, Dict[str, object]] = {}
+        for (person_type, _person_id), record in actions.items():
+            if record.get("action") != "sign_in":
+                continue
+            site = record.get("site", "").strip()
+            if not site:
+                person_store = self._data["staff" if person_type == "staff" else "clients"]
+                person = person_store.get(record.get("id"), {})
+                site = str(person.get("site", "")).strip()
+            label = site or "Unassigned"
+            entry = census.setdefault(
+                label,
+                {"site": label, "staff_present": 0, "clients_present": 0, "total_present": 0},
+            )
+            if person_type == "staff":
+                entry["staff_present"] += 1
+            else:
+                entry["clients_present"] += 1
+            entry["total_present"] = entry["staff_present"] + entry["clients_present"]
+
+        if known_locations:
+            for location in known_locations:
+                if location not in census:
+                    census[location] = {
+                        "site": location,
+                        "staff_present": 0,
+                        "clients_present": 0,
+                        "total_present": 0,
+                    }
+
+        return sorted(census.values(), key=lambda row: row["site"].lower())
+
 
 class EmergencyNotificationService:
     """Dispatch formatted emergency roll-call summaries."""

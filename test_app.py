@@ -4,6 +4,7 @@ import datetime
 import http.client
 import json
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -30,6 +31,9 @@ class SignInServerTestCase(unittest.TestCase):
         app.DATA['schedule'] = []
         app.DATA['signins'] = []
         app.SETTINGS['teams_webhook_url'] = ''
+        app.SETTINGS['locations'] = []
+        app.ASSIGNMENTS['staff'] = {}
+        app.ASSIGNMENTS['clients'] = {}
         self.server = None
         self.server_thread = None
         self.port = None
@@ -37,6 +41,12 @@ class SignInServerTestCase(unittest.TestCase):
         snapshot_path = os.path.join(app.RUNTIME_DIR, 'signins.json')
         if os.path.exists(snapshot_path):
             os.remove(snapshot_path)
+        assignments_path = os.path.join(app.RUNTIME_DIR, 'assignments.json')
+        if os.path.exists(assignments_path):
+            os.remove(assignments_path)
+        fire_dir = os.path.join(app.RUNTIME_DIR, 'fire_drills')
+        if os.path.isdir(fire_dir):
+            shutil.rmtree(fire_dir)
 
     def tearDown(self):
         if self.server is not None:
