@@ -133,22 +133,24 @@ class ReportingService:
             action = actions.get(key)
             if action and action.get("action") == "sign_in":
                 present.append(
-                    (
-                        schedule.get("person_type", "").title(),
-                        name,
-                        action.get("site", site),
-                        action.get("timestamp", ""),
-                    )
+                    {
+                        "person_type": schedule.get("person_type", "").title(),
+                        "person_id": schedule.get("id", ""),
+                        "name": name,
+                        "site": action.get("site", site),
+                        "timestamp": action.get("timestamp", ""),
+                    }
                 )
             else:
                 missing.append(
-                    (
-                        schedule.get("person_type", "").title(),
-                        name,
-                        site,
-                        contact_name,
-                        contact_phone,
-                    )
+                    {
+                        "person_type": schedule.get("person_type", "").title(),
+                        "person_id": schedule.get("id", ""),
+                        "name": name,
+                        "site": site,
+                        "contact_name": contact_name,
+                        "contact_phone": contact_phone,
+                    }
                 )
         return {"date": today, "present": present, "missing": missing}
 

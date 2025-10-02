@@ -32,8 +32,10 @@ For a production system you would likely replace these structures
 with a proper database and authentication system.
 """
 
+import csv
 import datetime
 import html
+import io
 import os
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -77,6 +79,16 @@ SETTINGS = {
 
 DATA_LOADER = CSVDataLoader(DATA)
 REPORTING_SERVICE = ReportingService(DATA)
+
+
+FIRE_DRILL_REASON_OPTIONS = [
+    "On community outing",
+    "Offsite appointment",
+    "Sick/Called off",
+    "Staffed remotely",
+    "Transport delay",
+    "Other",
+]
 
 
 def _snapshot_store() -> RuntimeSnapshotStore:
@@ -188,18 +200,32 @@ def format_emergency_markdown(status):
 
     if status['present']:
         lines.append('**Present**')
-        for ptype, name, site, timestamp in status['present']:
-            lines.append(f"- {ptype}: {name} @ {site} (since {timestamp})")
+        for person in status['present']:
+            timestamp = person.get('timestamp', '')
+            if timestamp:
+                lines.append(
+                    f"- {person.get('person_type', '')}: {person.get('name', '')} @ {person.get('site', '')} (since {timestamp})"
+                )
+            else:
+                lines.append(
+                    f"- {person.get('person_type', '')}: {person.get('name', '')} @ {person.get('site', '')}"
+                )
         lines.append('')
 
     if status['missing']:
         lines.append('**Missing Individuals**')
-        for ptype, name, site, cname, cphone in status['missing']:
-            contact_details = ', '.join(filter(None, [cname, cphone]))
+        for person in status['missing']:
+            contact_details = ', '.join(
+                filter(None, [person.get('contact_name', ''), person.get('contact_phone', '')])
+            )
             if contact_details:
-                lines.append(f"- {ptype}: {name} (Site: {site}; Contact: {contact_details})")
+                lines.append(
+                    f"- {person.get('person_type', '')}: {person.get('name', '')} (Site: {person.get('site', '')}; Contact: {contact_details})"
+                )
             else:
-                lines.append(f"- {ptype}: {name} (Site: {site})")
+                lines.append(
+                    f"- {person.get('person_type', '')}: {person.get('name', '')} (Site: {person.get('site', '')})"
+                )
         lines.append('')
     else:
         lines.append('All scheduled individuals are accounted for.')
@@ -251,6 +277,8 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._serve_admin()
         elif path == '/emergency':
             self._serve_emergency()
+        elif path == '/firedrill_report':
+            self._serve_firedrill_report_form()
         elif path == '/load_data':
             self._serve_load_data_page()
         elif path.startswith('/static/'):
@@ -268,6 +296,8 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
             self._handle_configure_teams()
         elif path == '/notify_teams':
             self._handle_notify_teams()
+        elif path == '/firedrill_report':
+            self._handle_firedrill_report_submission()
         else:
             self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
 
@@ -491,12 +521,23 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
         """Serve the emergency page showing who's on site and who is missing."""
         status = build_emergency_status()
         present_rows = ''.join([
-            f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{time}</td></tr>'
-            for (ptype, name, site, time) in status['present']
+            '<tr>'
+            f"<td>{html.escape(person.get('person_type', ''))}</td>"
+            f"<td>{html.escape(person.get('name', ''))}</td>"
+            f"<td>{html.escape(person.get('site', ''))}</td>"
+            f"<td>{html.escape(person.get('timestamp', ''))}</td>"
+            '</tr>'
+            for person in status['present']
         ])
         missing_rows = ''.join([
-            f'<tr><td>{ptype}</td><td>{name}</td><td>{site}</td><td>{cname}</td><td>{cphone}</td></tr>'
-            for (ptype, name, site, cname, cphone) in status['missing']
+            '<tr>'
+            f"<td>{html.escape(person.get('person_type', ''))}</td>"
+            f"<td>{html.escape(person.get('name', ''))}</td>"
+            f"<td>{html.escape(person.get('site', ''))}</td>"
+            f"<td>{html.escape(person.get('contact_name', ''))}</td>"
+            f"<td>{html.escape(person.get('contact_phone', ''))}</td>"
+            '</tr>'
+            for person in status['missing']
         ])
         if SETTINGS.get('teams_webhook_url'):
             preview_markdown = format_emergency_markdown(status)
@@ -517,10 +558,16 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
                 "Configure a Microsoft Teams webhook on the Load Data page to enable emergency notifications."
                 "</div>"
             )
+        button = (
+            '<a class="btn btn-success mb-3" href="/firedrill_report">Complete Fire Drill Report</a>'
+            if status['present'] or status['missing']
+            else ''
+        )
         body = f"""
 <h2>Emergency Roll Call</h2>
-<p>Date: {status['date']}</p>
+<p>Report for {status['date']}</p>
 {teams_notice}
+{button}
 <h3>Present on Site</h3>
 <table class="table table-success table-bordered">
   <thead><tr><th>Type</th><th>Name</th><th>Site</th><th>Signed In At</th></tr></thead>
@@ -537,6 +584,143 @@ class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
 </table>
 """
         self._send_response(self._html_template('Emergency Roll Call', body))
+
+    def _reason_field_name(self, person: dict) -> str:
+        person_type = person.get('person_type', '').lower().replace(' ', '_')
+        identifier = person.get('person_id', '')
+        return f"reason_{person_type}_{identifier}"
+
+    def _serve_firedrill_report_form(self):
+        status = build_emergency_status()
+        now = datetime.datetime.now()
+        default_timestamp = now.strftime('%Y-%m-%dT%H:%M')
+        missing_sections = []
+        for person in status['missing']:
+            field_name = self._reason_field_name(person)
+            options = ['<option value="">-- Select reason --</option>'] + [
+                f"<option value=\"{html.escape(reason)}\">{html.escape(reason)}</option>"
+                for reason in FIRE_DRILL_REASON_OPTIONS
+            ]
+            missing_sections.append(
+                "<div class=\"mb-3\">"
+                f"  <label class=\"form-label\" for=\"{field_name}\">"
+                f"{html.escape(person.get('person_type', ''))} - {html.escape(person.get('name', ''))} ({html.escape(person.get('site', '')) or 'No site'})"
+                "</label>"
+                f"  <select class=\"form-select\" id=\"{field_name}\" name=\"{field_name}\" required>"
+                f"    {' '.join(options)}"
+                "  </select>"
+                "</div>"
+            )
+        missing_html = ''.join(missing_sections) or '<p class="text-muted">All individuals accounted for.</p>'
+        present_html = ''.join(
+            [
+                '<li class="list-group-item">'
+                f"<strong>{html.escape(person.get('person_type', ''))}</strong>: {html.escape(person.get('name', ''))}"
+                f" &mdash; {html.escape(person.get('site', ''))}"
+                f" <span class=\"text-muted\">(since {html.escape(person.get('timestamp', ''))})</span>"
+                '</li>'
+                for person in status['present']
+            ]
+        ) or '<li class="list-group-item text-muted">No one is signed in.</li>'
+        body = f"""
+<h2>Fire Drill Report</h2>
+<p>Use this form to document the outcome of the most recent fire drill.</p>
+<form method="post" action="/firedrill_report">
+  <div class="row">
+    <div class="col-md-6">
+      <div class="mb-3">
+        <label class="form-label" for="drill_datetime">Fire drill date &amp; time</label>
+        <input type="datetime-local" class="form-control" id="drill_datetime" name="drill_datetime" value="{default_timestamp}" required>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="mb-3">
+        <label class="form-label" for="drill_location">Location</label>
+        <input type="text" class="form-control" id="drill_location" name="location" placeholder="e.g. Fort Wayne" required>
+      </div>
+    </div>
+  </div>
+  <div class="mb-4">
+    <h3>Accounted For</h3>
+    <ul class="list-group">
+      {present_html}
+    </ul>
+  </div>
+  <div class="mb-4">
+    <h3>Not Accounted For</h3>
+    {missing_html}
+  </div>
+  <button type="submit" class="btn btn-primary">Export Fire Drill Report</button>
+</form>
+"""
+        self._send_response(self._html_template('Fire Drill Report', body))
+
+    def _handle_firedrill_report_submission(self):
+        status = build_emergency_status()
+        length = int(self.headers.get('Content-Length', 0))
+        payload = self.rfile.read(length).decode('utf-8') if length else ''
+        params = parse_qs(payload)
+        location = params.get('location', [''])[0].strip()
+        drill_dt_raw = params.get('drill_datetime', [''])[0].strip()
+        if not location or not drill_dt_raw:
+            body = '<p class="text-danger">Fire drill date/time and location are required.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+            self._send_response(self._html_template('Fire Drill Report Error', body))
+            return
+        try:
+            drill_dt = datetime.datetime.fromisoformat(drill_dt_raw)
+        except ValueError:
+            body = '<p class="text-danger">Invalid date/time provided.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+            self._send_response(self._html_template('Fire Drill Report Error', body))
+            return
+        reasons = {}
+        for person in status['missing']:
+            field = self._reason_field_name(person)
+            reason = params.get(field, [''])[0].strip()
+            if status['missing'] and not reason:
+                body = '<p class="text-danger">Please select a reason for each individual who was not accounted for.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+                self._send_response(self._html_template('Fire Drill Report Error', body))
+                return
+            reasons[(person.get('person_type'), person.get('person_id'))] = reason
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(['Fire Drill Report'])
+        writer.writerow(['Generated At', datetime.datetime.now().isoformat(timespec='seconds')])
+        writer.writerow(['Fire Drill Date/Time', drill_dt.isoformat(timespec='minutes')])
+        writer.writerow(['Location', location])
+        writer.writerow([])
+        writer.writerow(['Person Type', 'Name', 'Site', 'Status', 'Details'])
+        for person in status['present']:
+            details = person.get('timestamp', '')
+            detail_text = f"Signed in at {details}" if details else ''
+            writer.writerow([
+                person.get('person_type', ''),
+                person.get('name', ''),
+                person.get('site', ''),
+                'Accounted For',
+                detail_text,
+            ])
+        for person in status['missing']:
+            key = (person.get('person_type'), person.get('person_id'))
+            reason = reasons.get(key, 'Reason not provided')
+            writer.writerow([
+                person.get('person_type', ''),
+                person.get('name', ''),
+                person.get('site', ''),
+                'Not Accounted For',
+                reason,
+            ])
+
+        csv_data = output.getvalue().encode('utf-8')
+        safe_location = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in location.strip()) or 'location'
+        timestamp_component = drill_dt.strftime('%Y%m%d-%H%M')
+        filename = f"firedrill_{timestamp_component}_{safe_location}.csv"
+        self.send_response(HTTPStatus.OK)
+        self.send_header('Content-Type', 'text/csv; charset=utf-8')
+        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+        self.send_header('Content-Length', str(len(csv_data)))
+        self.end_headers()
+        self.wfile.write(csv_data)
 
     def _serve_load_data_page(self):
         """Serve the page for uploading CSV files."""

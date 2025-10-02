@@ -231,6 +231,7 @@ client,c4,invalid,09:00,11:00,Fort Wayne
         # Missing client (c2) should list contact information.
         self.assertIn('Charlie Learner', html)
         self.assertIn('Parent Paul', html)
+        self.assertIn('Complete Fire Drill Report', html)
 
     def test_emergency_page_preview_when_webhook_configured(self):
         self._populate_sample_data()
@@ -256,8 +257,25 @@ client,c4,invalid,09:00,11:00,Fort Wayne
     def test_format_emergency_markdown_includes_present_and_missing(self):
         status = {
             'date': '2030-01-01',
-            'present': [('Staff', 'Alice', 'Fort Wayne', '09:00')],
-            'missing': [('Client', 'Bobby', 'Fort Wayne', 'Parent Patty', '555-0101')],
+            'present': [
+                {
+                    'person_type': 'Staff',
+                    'person_id': 's1',
+                    'name': 'Alice',
+                    'site': 'Fort Wayne',
+                    'timestamp': '09:00',
+                }
+            ],
+            'missing': [
+                {
+                    'person_type': 'Client',
+                    'person_id': 'c1',
+                    'name': 'Bobby',
+                    'site': 'Fort Wayne',
+                    'contact_name': 'Parent Patty',
+                    'contact_phone': '555-0101',
+                }
+            ],
         }
         markdown = app.format_emergency_markdown(status)
         self.assertIn('**Emergency Roll Call - 2030-01-01**', markdown)
@@ -312,6 +330,64 @@ client,c4,invalid,09:00,11:00,Fort Wayne
         self.assertIn('Successfully loaded staff data', html)
         self.assertIn('s9', app.DATA['staff'])
         self.assertEqual(app.DATA['staff']['s9']['name'], 'Zelda Therapist')
+
+    def test_firedrill_report_form_shows_reason_dropdowns(self):
+        self._populate_sample_data()
+        # Mark staff as present so at least one accounted for entry exists.
+        now = datetime.datetime.now().isoformat(timespec='seconds')
+        app.DATA['signins'] = [
+            {
+                'person_type': 'staff',
+                'id': 's1',
+                'name': 'Alice Therapist',
+                'site': 'Fort Wayne',
+                'timestamp': now,
+                'action': 'sign_in',
+            }
+        ]
+        self._start_server()
+
+        status_code, content_type, payload = self._request('GET', '/firedrill_report')
+        self.assertEqual(status_code, 200)
+        self.assertIn('text/html', content_type)
+        html = payload.decode('utf-8')
+        self.assertIn('Fire Drill Report', html)
+        self.assertIn('reason_client_c2', html)
+        for option in app.FIRE_DRILL_REASON_OPTIONS:
+            self.assertIn(option, html)
+
+    def test_firedrill_report_submission_downloads_csv(self):
+        self._populate_sample_data()
+        now = datetime.datetime(2030, 1, 1, 9, 0).isoformat(timespec='seconds')
+        app.DATA['signins'] = [
+            {
+                'person_type': 'staff',
+                'id': 's1',
+                'name': 'Alice Therapist',
+                'site': 'Fort Wayne',
+                'timestamp': now,
+                'action': 'sign_in',
+            }
+        ]
+        self._start_server()
+
+        body = (
+            'drill_datetime=2030-01-01T10%3A00'
+            '&location=Fort+Wayne+Center'
+            '&reason_client_c1=Sick%2FCalled+off'
+            '&reason_client_c2=On+community+outing'
+        )
+        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+        status_code, content_type, payload = self._request('POST', '/firedrill_report', body, headers)
+        self.assertEqual(status_code, 200)
+        self.assertIn('text/csv', content_type)
+        csv_text = payload.decode('utf-8')
+        self.assertIn('Fire Drill Date/Time,2030-01-01T10:00', csv_text)
+        self.assertIn('Fort Wayne Center', csv_text)
+        self.assertIn('Accounted For', csv_text)
+        self.assertIn('Not Accounted For', csv_text)
+        self.assertIn('Sick/Called off', csv_text)
+        self.assertIn('On community outing', csv_text)
 
 
 if __name__ == '__main__':
