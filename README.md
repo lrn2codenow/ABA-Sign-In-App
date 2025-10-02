@@ -74,6 +74,16 @@ complicated infrastructure.
    individuals, load data, view the admin dashboard, or check the
    emergency roll‑call list.
 
+## Working with Protected Branches
+
+Some branches in this repository enable GitHub's "verified commit signatures"
+protection. If you see the banner "Merging is blocked – commits must have
+verified signatures" while opening a pull request, configure signing by
+following [`docs/commit-signing-guide.md`](docs/commit-signing-guide.md).
+Once your GPG key is associated with your GitHub account, newly created
+commits will be marked as verified and merges into the protected branch will
+be allowed.
+
 ## Microsoft Teams emergency notifications
 
 The application can post an emergency roll call summary to a Microsoft
