@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ABA Sign-In App – Deployment Notice</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css">
+  <style>
+    body {
+      background: #f5f7fb;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2rem 1rem;
+    }
+    main {
+      max-width: 720px;
+      background: #ffffff;
+      border-radius: 1rem;
+      box-shadow: 0 1rem 2rem rgba(25, 42, 70, 0.08);
+      padding: 3rem 2.5rem;
+    }
+    h1 {
+      font-size: 2.125rem;
+      font-weight: 600;
+      color: #003366;
+    }
+    .lead {
+      font-size: 1.1rem;
+    }
+    code {
+      background: #eef2fa;
+      color: #d6336c;
+      padding: 0.2rem 0.4rem;
+      border-radius: 0.25rem;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>ABA Sign-In Application</h1>
+    <p class="lead">This project ships as a Python web server. The Netlify deployment only hosts this informational page so visitors do not receive a “Page Not Found” error when following the public link.</p>
+    <p>To interact with the full sign-in experience—including CSV uploads, the admin dashboard, and emergency roll-call reports—please run the application locally or on a platform that supports persistent Python services.</p>
+    <h2 class="h4 mt-4">Run locally</h2>
+    <ol>
+      <li>Install <strong>Python 3.8+</strong>.</li>
+      <li>Clone the repository and open a terminal in the project root.</li>
+      <li>Start the server:<br><code>python3 app.py</code></li>
+      <li>Open <a href="http://localhost:8000" target="_blank" rel="noopener">http://localhost:8000</a> in your browser.</li>
+    </ol>
+    <p>Need help? The <a href="https://github.com/" target="_blank" rel="noopener">project README</a> contains detailed setup instructions, or you can reach out to the team that shared the deployment link.</p>
+    <p class="text-muted mb-0">This static notice prevents Netlify visitors from encountering a 404 and clarifies why the interactive features are unavailable here.</p>
+  </main>
+</body>
+</html>
