@@ -595,7 +595,7 @@ def upload_csv_response(form: cgi.FieldStorage) -> AppResponse:
             load_csv(upload_path, category)
         else:
             load_schedule_csv(upload_path)
-    except Exception as exc:
+    except (csv.Error, ValueError, OSError) as exc:
         body = f'<p class="text-danger">Error processing CSV: {html.escape(str(exc))}</p>'
         return _html_response('Upload Error', body, HTTPStatus.BAD_REQUEST)
     finally:
