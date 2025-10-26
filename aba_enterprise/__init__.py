@@ -18,6 +18,7 @@ from .logging import configure_logging  # noqa: F401
 from .persistence import (
     AuditLogger,
     CSVDataLoader,
+    PersonAssignmentStore,
     RuntimeSnapshotStore,
     SettingsStore,
 )  # noqa: F401

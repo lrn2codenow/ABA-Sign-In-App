@@ -169,24 +169,92 @@ class SettingsStore:
         self._runtime_dir.mkdir(parents=True, exist_ok=True)
         self._path = self._runtime_dir / filename
 
-    def load(self) -> Dict[str, str]:
+    def load(self) -> Dict[str, object]:
+        defaults: Dict[str, object] = {"teams_webhook_url": "", "locations": []}
         if not self._path.exists():
-            return {"teams_webhook_url": ""}
+            return defaults
         try:
             with open(self._path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except (OSError, json.JSONDecodeError):
-            return {"teams_webhook_url": ""}
+            return defaults
         if not isinstance(data, dict):
-            return {"teams_webhook_url": ""}
-        result = {"teams_webhook_url": ""}
+            return defaults
+        result = dict(defaults)
         webhook = data.get("teams_webhook_url")
         if isinstance(webhook, str):
             result["teams_webhook_url"] = webhook
+        locations = data.get("locations", [])
+        if isinstance(locations, list):
+            cleaned_locations = []
+            for entry in locations:
+                if isinstance(entry, str):
+                    text = entry.strip()
+                    if text and text not in cleaned_locations:
+                        cleaned_locations.append(text)
+            result["locations"] = cleaned_locations
         return result
 
-    def save(self, settings: Dict[str, str]) -> None:
-        payload = {"teams_webhook_url": settings.get("teams_webhook_url", "")}
+    def save(self, settings: Dict[str, object]) -> None:
+        locations = settings.get("locations", [])
+        if not isinstance(locations, list):
+            locations = []
+        cleaned_locations = []
+        for entry in locations:
+            if isinstance(entry, str):
+                text = entry.strip()
+                if text and text not in cleaned_locations:
+                    cleaned_locations.append(text)
+        payload = {
+            "teams_webhook_url": settings.get("teams_webhook_url", ""),
+            "locations": cleaned_locations,
+        }
+        with open(self._path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
+
+class PersonAssignmentStore:
+    """Persist overrides for staff and client building assignments."""
+
+    def __init__(self, runtime_dir: Path, filename: str = "assignments.json") -> None:
+        self._runtime_dir = Path(runtime_dir)
+        self._runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._path = self._runtime_dir / filename
+
+    def load(self) -> Dict[str, Dict[str, str]]:
+        defaults = {"staff": {}, "clients": {}}
+        if not self._path.exists():
+            return defaults
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return defaults
+        if not isinstance(data, dict):
+            return defaults
+        result = {"staff": {}, "clients": {}}
+        for category in ("staff", "clients"):
+            entries = data.get(category, {})
+            if not isinstance(entries, dict):
+                continue
+            category_result: Dict[str, str] = {}
+            for key, value in entries.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    category_result[key] = value.strip()
+            result[category] = category_result
+        return result
+
+    def save(self, assignments: Dict[str, Dict[str, str]]) -> None:
+        payload = {"staff": {}, "clients": {}}
+        for category in ("staff", "clients"):
+            entries = assignments.get(category, {}) if isinstance(assignments, dict) else {}
+            if not isinstance(entries, dict):
+                continue
+            category_payload: Dict[str, str] = {}
+            for key, value in entries.items():
+                if isinstance(key, str) and isinstance(value, str):
+                    category_payload[key] = value.strip()
+            payload[category] = category_payload
         with open(self._path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
 
