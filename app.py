@@ -37,10 +37,13 @@ import datetime
 import html
 import io
 import os
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import parse_qs
+from typing import Dict, Iterable, Mapping, Optional
+from urllib.parse import parse_qs, urlparse
 import cgi
+import email.message
 
 from aba_enterprise import (
     AppConfig,
@@ -89,6 +92,666 @@ FIRE_DRILL_REASON_OPTIONS = [
     "Transport delay",
     "Other",
 ]
+
+
+def _reason_field_name(person: Mapping[str, str]) -> str:
+    person_type = person.get('person_type', '').lower().replace(' ', '_')
+    identifier = person.get('person_id', '')
+    return f"reason_{person_type}_{identifier}"
+
+
+@dataclass
+class AppResponse:
+    """Simple representation of an HTTP response produced by the app router."""
+
+    status: HTTPStatus
+    headers: Dict[str, str]
+    body: bytes
+
+
+def _html_template(title: str, body: str) -> bytes:
+    """Wrap the provided body in a standard HTML template."""
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"UTF-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
+  <title>{title}</title>
+  <link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css\">
+</head>
+<body class=\"bg-light\">
+<nav class=\"navbar navbar-expand-lg navbar-dark bg-primary mb-4\">
+  <div class=\"container-fluid\">
+    <a class=\"navbar-brand\" href=\"/\">ABA Sign In</a>
+    <button class=\"navbar-toggler\" type=\"button\" data-bs-toggle=\"collapse\" data-bs-target=\"#navbarNav\" aria-controls=\"navbarNav\" aria-expanded=\"false\" aria-label=\"Toggle navigation\">
+      <span class=\"navbar-toggler-icon\"></span>
+    </button>
+    <div class=\"collapse navbar-collapse\" id=\"navbarNav\">
+      <ul class=\"navbar-nav\">
+        <li class=\"nav-item\"><a class=\"nav-link\" href=\"/\">Home</a></li>
+        <li class=\"nav-item\"><a class=\"nav-link\" href=\"/admin\">Admin</a></li>
+        <li class=\"nav-item\"><a class=\"nav-link\" href=\"/emergency\">Emergency</a></li>
+        <li class=\"nav-item\"><a class=\"nav-link\" href=\"/load_data\">Load Data</a></li>
+      </ul>
+    </div>
+  </div>
+</nav>
+<div class=\"container\">
+  {body}
+</div>
+</body>
+</html>"""
+    return html_doc.encode("utf-8")
+
+
+def _html_response(title: str, body: str, status: HTTPStatus = HTTPStatus.OK,
+                   extra_headers: Optional[Mapping[str, str]] = None) -> AppResponse:
+    content = _html_template(title, body)
+    headers = {"Content-Type": "text/html; charset=utf-8", "Content-Length": str(len(content))}
+    if extra_headers:
+        headers.update(extra_headers)
+    return AppResponse(status=status, headers=headers, body=content)
+
+
+def _text_response(body: str, status: HTTPStatus = HTTPStatus.OK,
+                   content_type: str = "text/plain") -> AppResponse:
+    headers = {"Content-Type": content_type, "Content-Length": str(len(body.encode("utf-8")))}
+    return AppResponse(status=status, headers=headers, body=body.encode("utf-8"))
+
+
+def _parse_urlencoded(body: bytes) -> Dict[str, str]:
+    if not body:
+        return {}
+    data = parse_qs(body.decode('utf-8'), keep_blank_values=True)
+    result: Dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(value, list):
+            result[key] = value[0]
+        else:
+            result[key] = value
+    return result
+
+
+def _build_message_from_headers(headers: Mapping[str, str]) -> email.message.Message:
+    msg = email.message.Message()
+    for key, value in headers.items():
+        msg[key] = value
+    return msg
+
+
+def _parse_multipart_form(headers: Mapping[str, str], body: bytes) -> cgi.FieldStorage:
+    environ = {
+        'REQUEST_METHOD': 'POST',
+        'CONTENT_TYPE': headers.get('Content-Type', ''),
+    }
+    content_length = headers.get('Content-Length') or str(len(body))
+    environ['CONTENT_LENGTH'] = content_length
+    message = headers if isinstance(headers, email.message.Message) else _build_message_from_headers(headers)
+    return cgi.FieldStorage(fp=io.BytesIO(body), headers=message, environ=environ)
+
+
+def _home_body() -> str:
+    staff_options = ''.join(
+        [f'<option value="staff|{sid}">{html.escape(rec.get("name", ""))}</option>' for sid, rec in DATA['staff'].items()]
+    )
+    client_options = ''.join(
+        [f'<option value="client|{cid}">{html.escape(rec.get("name", ""))}</option>' for cid, rec in DATA['clients'].items()]
+    )
+    return f"""
+<div class=\"row\">
+  <div class=\"col-md-6\">
+    <h2>Staff Sign In/Out</h2>
+    <form method=\"post\" action=\"/sign_action\">
+      <div class=\"mb-3\">
+        <label for=\"staff_select\" class=\"form-label\">Select staff member</label>
+        <select class=\"form-select\" id=\"staff_select\" name=\"person\" required>
+          <option value=\"\">-- Choose staff --</option>
+          {staff_options}
+        </select>
+      </div>
+      <div class=\"mb-3\">
+        <label class=\"form-label\">Action</label><br>
+        <div class=\"form-check form-check-inline\">
+          <input class=\"form-check-input\" type=\"radio\" name=\"action\" id=\"staff_in\" value=\"sign_in\" checked>
+          <label class=\"form-check-label\" for=\"staff_in\">Sign In</label>
+        </div>
+        <div class=\"form-check form-check-inline\">
+          <input class=\"form-check-input\" type=\"radio\" name=\"action\" id=\"staff_out\" value=\"sign_out\">
+          <label class=\"form-check-label\" for=\"staff_out\">Sign Out</label>
+        </div>
+      </div>
+      <div class=\"mb-3\">
+        <label for=\"staff_site\" class=\"form-label\">Site</label>
+        <input type=\"text\" class=\"form-control\" id=\"staff_site\" name=\"site\" placeholder=\"e.g. Fort Wayne\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Submit</button>
+    </form>
+  </div>
+  <div class=\"col-md-6\">
+    <h2>Client Sign In/Out</h2>
+    <form method=\"post\" action=\"/sign_action\">
+      <div class=\"mb-3\">
+        <label for=\"client_select\" class=\"form-label\">Select client</label>
+        <select class=\"form-select\" id=\"client_select\" name=\"person\" required>
+          <option value=\"\">-- Choose client --</option>
+          {client_options}
+        </select>
+      </div>
+      <div class=\"mb-3\">
+        <label class=\"form-label\">Action</label><br>
+        <div class=\"form-check form-check-inline\">
+          <input class=\"form-check-input\" type=\"radio\" name=\"action\" id=\"client_in\" value=\"sign_in\" checked>
+          <label class=\"form-check-label\" for=\"client_in\">Sign In</label>
+        </div>
+        <div class=\"form-check form-check-inline\">
+          <input class=\"form-check-input\" type=\"radio\" name=\"action\" id=\"client_out\" value=\"sign_out\">
+          <label class=\"form-check-label\" for=\"client_out\">Sign Out</label>
+        </div>
+      </div>
+      <div class=\"mb-3\">
+        <label for=\"client_site\" class=\"form-label\">Site</label>
+        <input type=\"text\" class=\"form-control\" id=\"client_site\" name=\"site\" placeholder=\"e.g. Fort Wayne\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Submit</button>
+    </form>
+  </div>
+</div>
+"""
+
+
+def home_response() -> AppResponse:
+    return _html_response("Home - ABA Sign In", _home_body())
+
+
+def _admin_body() -> str:
+    today = datetime.date.today().isoformat()
+    rows = REPORTING_SERVICE.build_schedule_matrix(today)
+    table_rows = ''.join(
+        [
+            f"<tr><td>{row['person_type']}</td><td>{row['name']}</td><td>{row['start_time']}</td>"
+            f"<td>{row['end_time']}</td><td>{row['site']}</td><td>{row['status']}</td><td>{row['sign_time']}</td></tr>"
+            for row in rows
+        ]
+    )
+    history_entries = []
+    for rec in DATA['signins'][-20:][::-1]:
+        action_str = rec['action'].replace('_', ' ').title()
+        history_entries.append(
+            f"<tr><td>{rec['timestamp']}</td><td>{rec['person_type'].title()}</td><td>{rec['name']}</td>"
+            f"<td>{rec['site']}</td><td>{action_str}</td></tr>"
+        )
+    history_rows = ''.join(history_entries)
+    return f"""
+<h2>Admin Dashboard</h2>
+<p>Today is {today}</p>
+<h3>Schedule vs Attendance</h3>
+<table class=\"table table-striped\">
+  <thead>
+    <tr><th>Type</th><th>Name</th><th>Start</th><th>End</th><th>Site</th><th>Status</th><th>Sign Time</th></tr>
+  </thead>
+  <tbody>
+    {table_rows}
+  </tbody>
+</table>
+<h3>Sign‑In History (latest 20 entries)</h3>
+<table class=\"table table-bordered\">
+  <thead>
+    <tr><th>Timestamp</th><th>Type</th><th>Name</th><th>Site</th><th>Action</th></tr>
+  </thead>
+  <tbody>
+            {history_rows}
+  </tbody>
+</table>
+"""
+
+
+def admin_response() -> AppResponse:
+    return _html_response("Admin Dashboard", _admin_body())
+
+
+def _emergency_body() -> str:
+    status = build_emergency_status()
+    present_rows = ''.join(
+        [
+            '<tr>'
+            f"<td>{html.escape(person.get('person_type', ''))}</td>"
+            f"<td>{html.escape(person.get('name', ''))}</td>"
+            f"<td>{html.escape(person.get('site', ''))}</td>"
+            f"<td>{html.escape(person.get('timestamp', ''))}</td>"
+            '</tr>'
+            for person in status['present']
+        ]
+    )
+    missing_rows = ''.join(
+        [
+            '<tr>'
+            f"<td>{html.escape(person.get('person_type', ''))}</td>"
+            f"<td>{html.escape(person.get('name', ''))}</td>"
+            f"<td>{html.escape(person.get('site', ''))}</td>"
+            f"<td>{html.escape(person.get('contact_name', ''))}</td>"
+            f"<td>{html.escape(person.get('contact_phone', ''))}</td>"
+            '</tr>'
+            for person in status['missing']
+        ]
+    )
+    if SETTINGS.get('teams_webhook_url'):
+        preview_markdown = format_emergency_markdown(status)
+        preview_html = html.escape(preview_markdown).replace('\n', '<br>')
+        teams_notice = (
+            "<form method=\"post\" action=\"/notify_teams\">"
+            "  <button type=\"submit\" class=\"btn btn-warning mb-3\">Send Teams Emergency Notification</button>"
+            "</form>"
+            "<p class=\"text-muted\">A notification will be posted to the configured Microsoft Teams channel.</p>"
+            "<details class=\"mb-3\">"
+            "  <summary>Preview Teams message</summary>"
+            f"  <div class=\"mt-2 p-3 bg-white border rounded\">{preview_html}</div>"
+            "</details>"
+        )
+    else:
+        teams_notice = (
+            "<div class=\"alert alert-info\" role=\"alert\">"
+            "Configure a Microsoft Teams webhook on the Load Data page to enable emergency notifications."
+            "</div>"
+        )
+    button = (
+        '<a class="btn btn-success mb-3" href="/firedrill_report">Complete Fire Drill Report</a>'
+        if status['present'] or status['missing']
+        else ''
+    )
+    return f"""
+<h2>Emergency Roll Call</h2>
+<p>Report for {status['date']}</p>
+{teams_notice}
+{button}
+<h3>Present on Site</h3>
+<table class=\"table table-success table-bordered\">
+  <thead><tr><th>Type</th><th>Name</th><th>Site</th><th>Signed In At</th></tr></thead>
+  <tbody>
+    {present_rows or '<tr><td colspan=\"4\">No one is currently signed in according to records.</td></tr>'}
+  </tbody>
+</table>
+<h3>Scheduled but Missing</h3>
+<table class=\"table table-danger table-bordered\">
+  <thead><tr><th>Type</th><th>Name</th><th>Expected Site</th><th>Contact Name</th><th>Contact Phone</th></tr></thead>
+  <tbody>
+    {missing_rows or '<tr><td colspan=\"5\">No one is missing according to schedule.</td></tr>'}
+  </tbody>
+</table>
+"""
+
+
+def emergency_response() -> AppResponse:
+    return _html_response("Emergency Roll Call", _emergency_body())
+
+
+def _firedrill_form_body() -> str:
+    status = build_emergency_status()
+    now = datetime.datetime.now()
+    default_timestamp = now.strftime('%Y-%m-%dT%H:%M')
+    missing_sections = []
+    for person in status['missing']:
+        field_name = _reason_field_name(person)
+        options = ['<option value="">-- Select reason --</option>'] + [
+            f"<option value=\"{html.escape(reason)}\">{html.escape(reason)}</option>"
+            for reason in FIRE_DRILL_REASON_OPTIONS
+        ]
+        missing_sections.append(
+            "<div class=\"mb-3\">"
+            f"  <label class=\"form-label\" for=\"{field_name}\">"
+            f"{html.escape(person.get('person_type', ''))} - {html.escape(person.get('name', ''))} ({html.escape(person.get('site', '')) or 'No site'})"
+            "</label>"
+            f"  <select class=\"form-select\" id=\"{field_name}\" name=\"{field_name}\" required>"
+            f"    {' '.join(options)}"
+            "  </select>"
+            "</div>"
+        )
+    missing_html = ''.join(missing_sections) or '<p class="text-muted">All individuals accounted for.</p>'
+    present_html = ''.join(
+        [
+            '<li class="list-group-item">'
+            f"<strong>{html.escape(person.get('person_type', ''))}</strong>: {html.escape(person.get('name', ''))}"
+            f" &mdash; {html.escape(person.get('site', ''))}"
+            f" <span class=\"text-muted\">(since {html.escape(person.get('timestamp', ''))})</span>"
+            '</li>'
+            for person in status['present']
+        ]
+    ) or '<li class="list-group-item text-muted">No one is signed in.</li>'
+    return f"""
+<h2>Fire Drill Report</h2>
+<p>Use this form to document the outcome of the most recent fire drill.</p>
+<form method=\"post\" action=\"/firedrill_report\">
+  <div class=\"row\">
+    <div class=\"col-md-6\">
+      <div class=\"mb-3\">
+        <label class=\"form-label\" for=\"drill_datetime\">Fire drill date &amp; time</label>
+        <input type=\"datetime-local\" class=\"form-control\" id=\"drill_datetime\" name=\"drill_datetime\" value=\"{default_timestamp}\" required>
+      </div>
+    </div>
+    <div class=\"col-md-6\">
+      <div class=\"mb-3\">
+        <label class=\"form-label\" for=\"drill_location\">Location</label>
+        <input type=\"text\" class=\"form-control\" id=\"drill_location\" name=\"location\" placeholder=\"e.g. Fort Wayne\" required>
+      </div>
+    </div>
+  </div>
+  <div class=\"mb-4\">
+    <h3>Accounted For</h3>
+    <ul class=\"list-group\">
+      {present_html}
+    </ul>
+  </div>
+  <div class=\"mb-4\">
+    <h3>Not Accounted For</h3>
+    {missing_html}
+  </div>
+  <button type=\"submit\" class=\"btn btn-primary\">Export Fire Drill Report</button>
+</form>
+"""
+
+
+def firedrill_form_response() -> AppResponse:
+    return _html_response("Fire Drill Report", _firedrill_form_body())
+
+
+def _load_data_body() -> str:
+    webhook_status = 'Configured' if SETTINGS.get('teams_webhook_url') else 'Not Configured'
+    webhook_hint = (
+        f"<span class=\"badge bg-success\">{webhook_status}</span>"
+        if SETTINGS.get('teams_webhook_url')
+        else f"<span class=\"badge bg-secondary\">{webhook_status}</span>"
+    )
+    return f"""
+<h2>Load Data</h2>
+<p>Use this page to upload CSV files for staff, clients, and schedules. The server will overwrite existing data in memory.</p>
+<div class=\"row\">
+  <div class=\"col-md-4\">
+    <h4>Upload Staff CSV</h4>
+    <form method=\"post\" action=\"/upload_csv\" enctype=\"multipart/form-data\">
+      <input type=\"hidden\" name=\"category\" value=\"staff\">
+      <div class=\"mb-3\">
+        <input class=\"form-control\" type=\"file\" name=\"file\" accept=\".csv\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Upload Staff</button>
+    </form>
+  </div>
+  <div class=\"col-md-4\">
+    <h4>Upload Clients CSV</h4>
+    <form method=\"post\" action=\"/upload_csv\" enctype=\"multipart/form-data\">
+      <input type=\"hidden\" name=\"category\" value=\"clients\">
+      <div class=\"mb-3\">
+        <input class=\"form-control\" type=\"file\" name=\"file\" accept=\".csv\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Upload Clients</button>
+    </form>
+  </div>
+  <div class=\"col-md-4\">
+    <h4>Upload Schedule CSV</h4>
+    <form method=\"post\" action=\"/upload_csv\" enctype=\"multipart/form-data\">
+      <input type=\"hidden\" name=\"category\" value=\"schedule\">
+      <div class=\"mb-3\">
+        <input class=\"form-control\" type=\"file\" name=\"file\" accept=\".csv\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Upload Schedule</button>
+    </form>
+  </div>
+</div>
+<hr>
+<div class=\"row\">
+  <div class=\"col-md-6\">
+    <h4>Microsoft Teams Emergency Notifications {webhook_hint}</h4>
+    <p>Provide an incoming webhook URL from your Microsoft Teams channel to enable one-click emergency notifications.</p>
+    <form method=\"post\" action=\"/configure_teams\">
+      <div class=\"mb-3\">
+        <label for=\"teams_webhook\" class=\"form-label\">Teams Webhook URL</label>
+        <input type=\"url\" class=\"form-control\" id=\"teams_webhook\" name=\"webhook\" placeholder=\"https://...\" value=\"{SETTINGS.get('teams_webhook_url', '')}\" required>
+      </div>
+      <button type=\"submit\" class=\"btn btn-primary\">Save Webhook</button>
+    </form>
+    <p class=\"mt-2 text-muted\">The URL is stored on this server only and used when sending an emergency notification.</p>
+  </div>
+</div>
+"""
+
+
+def load_data_response() -> AppResponse:
+    return _html_response("Load Data", _load_data_body())
+
+
+def _sign_event_from_form(form: Mapping[str, str]) -> Optional[Dict[str, str]]:
+    person_field = form.get('person')
+    action_field = form.get('action')
+    site_field = form.get('site')
+    if not person_field or not action_field or not site_field:
+        return None
+    if '|' not in person_field:
+        return None
+    person_type, person_id = person_field.split('|', 1)
+    person_type = person_type.strip().lower()
+    person_id = person_id.strip()
+    if person_type not in {'staff', 'client'}:
+        return None
+    records = DATA['staff'] if person_type == 'staff' else DATA['clients']
+    person = records.get(person_id)
+    if not person:
+        return None
+    timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    site = site_field.strip()
+    if not site:
+        return None
+    action = action_field.strip().lower()
+    if action not in {'sign_in', 'sign_out'}:
+        return None
+    event = {
+        'person_type': person_type,
+        'person_id': person_id,
+        'name': person.get('name', ''),
+        'site': site,
+        'timestamp': timestamp,
+        'action': action,
+    }
+    return event
+
+
+def sign_action_response(form: Mapping[str, str]) -> AppResponse:
+    event = _sign_event_from_form(form)
+    if not event:
+        body = '<p class="text-danger">Invalid submission.</p><a href="/" class="btn btn-secondary">Back to Home</a>'
+        return _html_response('Error', body, HTTPStatus.BAD_REQUEST)
+    recorded = _sign_in_service().record_action(
+        person_type=event['person_type'],
+        person_id=event['person_id'],
+        action=event['action'],
+        site=event['site'],
+    )
+    message = (
+        f"Successfully recorded {event['action'].replace('_', ' ').title()} for {html.escape(event['name'])} at {recorded['timestamp']}"
+    )
+    body = (
+        f'<div class="alert alert-success" role="alert">{message}</div><a href="/" class="btn btn-primary">Return to Home</a>'
+    )
+    return _html_response('Submission Received', body)
+
+
+def upload_csv_response(form: cgi.FieldStorage) -> AppResponse:
+    category = form.getvalue('category') if form else None
+    fileitem = form['file'] if form and 'file' in form else None
+    if (
+        category not in ('staff', 'clients', 'schedule')
+        or fileitem is None
+        or getattr(fileitem, 'file', None) is None
+    ):
+        body = '<p class="text-danger">Invalid upload request.</p><a href="/load_data" class="btn btn-secondary">Back</a>'
+        return _html_response('Error', body, HTTPStatus.BAD_REQUEST)
+    upload_path = os.path.join(RUNTIME_DIR, f'tmp_upload_{category}.csv')
+    with open(upload_path, 'wb') as fout:
+        while True:
+            chunk = fileitem.file.read(8192)
+            if not chunk:
+                break
+            fout.write(chunk)
+    try:
+        if category in ('staff', 'clients'):
+            load_csv(upload_path, category)
+        else:
+            load_schedule_csv(upload_path)
+    except (csv.Error, ValueError, OSError) as exc:
+        body = f'<p class="text-danger">Error processing CSV: {html.escape(str(exc))}</p>'
+        return _html_response('Upload Error', body, HTTPStatus.BAD_REQUEST)
+    finally:
+        try:
+            os.remove(upload_path)
+        except OSError:
+            pass
+    message = f'Successfully loaded {html.escape(category)} data.'
+    body = f'<div class="alert alert-success" role="alert">{message}</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
+    return _html_response('Upload Successful', body)
+
+
+def configure_teams_response(form: Mapping[str, str]) -> AppResponse:
+    webhook = form.get('webhook', '').strip()
+    if not webhook:
+        body = '<p class="text-danger">No webhook URL provided.</p><a href="/load_data" class="btn btn-secondary">Back</a>'
+        return _html_response('Teams Configuration Error', body, HTTPStatus.BAD_REQUEST)
+    if not webhook.lower().startswith('https://'):
+        body = '<p class="text-danger">Webhook URLs must start with https://</p><a href="/load_data" class="btn btn-secondary">Back</a>'
+        return _html_response('Teams Configuration Error', body, HTTPStatus.BAD_REQUEST)
+    SETTINGS['teams_webhook_url'] = webhook
+    save_settings()
+    body = '<div class="alert alert-success" role="alert">Microsoft Teams webhook saved.</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
+    return _html_response('Teams Configuration Saved', body)
+
+
+def notify_teams_response() -> AppResponse:
+    webhook = SETTINGS.get('teams_webhook_url', '').strip()
+    if not webhook:
+        body = '<p class="text-danger">No Microsoft Teams webhook configured.</p><a href="/emergency" class="btn btn-secondary">Back</a>'
+        return _html_response('Notification Error', body, HTTPStatus.BAD_REQUEST)
+    status = build_emergency_status()
+    success, message = send_teams_notification(webhook, status)
+    if not success:
+        body = f'<p class="text-danger">{html.escape(message)}</p><a href="/emergency" class="btn btn-secondary">Back to Emergency</a>'
+        return _html_response('Notification Error', body, HTTPStatus.BAD_REQUEST)
+    body = f'<div class="alert alert-success" role="alert">{html.escape(message)}</div><a href="/emergency" class="btn btn-primary">Back to Emergency</a>'
+    return _html_response('Notification Sent', body)
+
+
+def firedrill_submission_response(form: Mapping[str, str]) -> AppResponse:
+    status = build_emergency_status()
+    location = form.get('location', '').strip()
+    drill_dt_raw = form.get('drill_datetime', '').strip()
+    if not location or not drill_dt_raw:
+        body = '<p class="text-danger">Fire drill date/time and location are required.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+        return _html_response('Fire Drill Report Error', body, HTTPStatus.BAD_REQUEST)
+    try:
+        drill_dt = datetime.datetime.fromisoformat(drill_dt_raw)
+    except ValueError:
+        body = '<p class="text-danger">Invalid date/time provided.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+        return _html_response('Fire Drill Report Error', body, HTTPStatus.BAD_REQUEST)
+    reasons = {}
+    for person in status['missing']:
+        field = _reason_field_name(person)
+        reason = form.get(field, '').strip()
+        if status['missing'] and not reason:
+            body = '<p class="text-danger">Please select a reason for each individual who was not accounted for.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
+            return _html_response('Fire Drill Report Error', body, HTTPStatus.BAD_REQUEST)
+        reasons[(person.get('person_type'), person.get('person_id'))] = reason
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Fire Drill Report'])
+    writer.writerow(['Generated At', datetime.datetime.now().isoformat(timespec='seconds')])
+    writer.writerow(['Fire Drill Date/Time', drill_dt.isoformat(timespec='minutes')])
+    writer.writerow(['Location', location])
+    writer.writerow([])
+    writer.writerow(['Person Type', 'Name', 'Site', 'Status', 'Details'])
+    for person in status['present']:
+        details = person.get('timestamp', '')
+        detail_text = f"Signed in at {details}" if details else ''
+        writer.writerow([
+            person.get('person_type', ''),
+            person.get('name', ''),
+            person.get('site', ''),
+            'Accounted For',
+            detail_text,
+        ])
+    for person in status['missing']:
+        key = (person.get('person_type'), person.get('person_id'))
+        reason = reasons.get(key, 'Reason not provided')
+        writer.writerow([
+            person.get('person_type', ''),
+            person.get('name', ''),
+            person.get('site', ''),
+            'Not Accounted For',
+            reason,
+        ])
+    csv_data = output.getvalue().encode('utf-8')
+    safe_location = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in location.strip()) or 'location'
+    timestamp_component = drill_dt.strftime('%Y%m%d-%H%M')
+    filename = f"firedrill_{timestamp_component}_{safe_location}.csv"
+    headers = {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': f'attachment; filename="{filename}"',
+        'Content-Length': str(len(csv_data)),
+    }
+    return AppResponse(status=HTTPStatus.OK, headers=headers, body=csv_data)
+
+
+def static_file_response(path: str) -> AppResponse:
+    file_path = os.path.join(BASE_DIR, path.lstrip('/'))
+    if not os.path.isfile(file_path):
+        return _text_response('File not found', HTTPStatus.NOT_FOUND)
+    with open(file_path, 'rb') as handle:
+        content = handle.read()
+    content_type = 'text/css' if file_path.endswith('.css') else 'application/octet-stream'
+    headers = {'Content-Type': content_type, 'Content-Length': str(len(content))}
+    return AppResponse(status=HTTPStatus.OK, headers=headers, body=content)
+
+
+class AppRouter:
+    """Route HTTP requests to the appropriate handler functions."""
+
+    def handle(self, method: str, raw_path: str, headers: Mapping[str, str], body: bytes) -> AppResponse:
+        parsed = urlparse(raw_path)
+        path = parsed.path or '/'
+        method = (method or 'GET').upper()
+        if method == 'GET':
+            if path == '/':
+                return home_response()
+            if path == '/admin':
+                return admin_response()
+            if path == '/emergency':
+                return emergency_response()
+            if path == '/firedrill_report':
+                return firedrill_form_response()
+            if path == '/load_data':
+                return load_data_response()
+            if path.startswith('/static/'):
+                return static_file_response(path)
+            return _text_response('Not found', HTTPStatus.NOT_FOUND)
+        if method == 'POST':
+            if path == '/sign_action':
+                form = _parse_urlencoded(body)
+                return sign_action_response(form)
+            if path == '/configure_teams':
+                form = _parse_urlencoded(body)
+                return configure_teams_response(form)
+            if path == '/notify_teams':
+                return notify_teams_response()
+            if path == '/firedrill_report':
+                form = _parse_urlencoded(body)
+                return firedrill_submission_response(form)
+            if path == '/upload_csv':
+                form = _parse_multipart_form(headers, body)
+                return upload_csv_response(form)
+            return _text_response('Not found', HTTPStatus.NOT_FOUND)
+        if method == 'HEAD':
+            # Reuse GET logic but clear body to comply with HEAD semantics.
+            get_response = self.handle('GET', raw_path, headers, body)
+            return AppResponse(status=get_response.status, headers=get_response.headers, body=b'')
+        return _text_response('Method not allowed', HTTPStatus.METHOD_NOT_ALLOWED)
+
+
+ROUTER = AppRouter()
 
 
 def _snapshot_store() -> RuntimeSnapshotStore:
@@ -248,617 +911,35 @@ def send_teams_notification(webhook, status):
 
 
 class SignInHTTPRequestHandler(BaseHTTPRequestHandler):
-    """Request handler for the sign‑in application.
+    """HTTP handler that delegates routing to the shared app router."""
 
-    This handler serves HTML pages for signing in/out, uploading CSV files,
-    and viewing the admin dashboard. It uses simple string templates
-    constructed in Python without any templating library. All pages
-    reference bootstrap CSS via CDN for basic styling.
-    """
+    server_version = "ABASignIn/1.0"
 
-    def _send_response(
-        self,
-        content: bytes,
-        content_type: str = 'text/html',
-        status: HTTPStatus = HTTPStatus.OK,
-    ):
-        self.send_response(status)
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', str(len(content)))
+    def _send_app_response(self, response: AppResponse) -> None:
+        status_code = response.status.value if isinstance(response.status, HTTPStatus) else int(response.status)
+        self.send_response(status_code)
+        for key, value in response.headers.items():
+            self.send_header(str(key), str(value))
         self.end_headers()
-        if self.command != 'HEAD':
-            self.wfile.write(content)
+        if self.command != 'HEAD' and response.body:
+            self.wfile.write(response.body)
 
-    def do_GET(self):
-        path = self.path.split('?')[0]
-        if path == '/':
-            self._serve_home()
-        elif path == '/admin':
-            self._serve_admin()
-        elif path == '/emergency':
-            self._serve_emergency()
-        elif path == '/firedrill_report':
-            self._serve_firedrill_report_form()
-        elif path == '/load_data':
-            self._serve_load_data_page()
-        elif path.startswith('/static/'):
-            self._serve_static(path)
-        else:
-            self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
+    def do_GET(self) -> None:
+        response = ROUTER.handle('GET', self.path, self.headers, b'')
+        self._send_app_response(response)
 
-    def do_POST(self):
-        path = self.path.split('?')[0]
-        if path == '/sign_action':
-            self._handle_sign_action()
-        elif path == '/upload_csv':
-            self._handle_upload_csv()
-        elif path == '/configure_teams':
-            self._handle_configure_teams()
-        elif path == '/notify_teams':
-            self._handle_notify_teams()
-        elif path == '/firedrill_report':
-            self._handle_firedrill_report_submission()
-        else:
-            self._send_response(b'Not found', 'text/plain', HTTPStatus.NOT_FOUND)
+    def do_POST(self) -> None:
+        length = int(self.headers.get('Content-Length', '0') or 0)
+        body = self.rfile.read(length) if length else b''
+        response = ROUTER.handle('POST', self.path, self.headers, body)
+        self._send_app_response(response)
 
-    # Allow basic uptime/health checks that rely on HTTP HEAD requests.
-    def do_HEAD(self):  # pragma: no cover - simple delegation to GET logic
-        self.do_GET()
+    def do_HEAD(self) -> None:  # pragma: no cover - simple delegation
+        response = ROUTER.handle('HEAD', self.path, self.headers, b'')
+        self._send_app_response(response)
 
-    # Static file serving (limited to CSS)
-    def _serve_static(self, path: str):
-        file_path = os.path.join(BASE_DIR, path.lstrip('/'))
-        if not os.path.isfile(file_path):
-            self._send_response(b'File not found', 'text/plain', HTTPStatus.NOT_FOUND)
-            return
-        with open(file_path, 'rb') as f:
-            content = f.read()
-        content_type = 'text/css' if file_path.endswith('.css') else 'application/octet-stream'
-        self._send_response(content, content_type)
-
-    # Page templates
-    def _html_template(self, title: str, body: str) -> bytes:
-        """Wrap the provided body in a simple HTML document."""
-        html = f"""
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{title}</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.1/dist/css/bootstrap.min.css">
-</head>
-<body class="bg-light">
-<nav class="navbar navbar-expand-lg navbar-dark bg-primary mb-4">
-  <div class="container-fluid">
-    <a class="navbar-brand" href="/">ABA Sign In</a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
-      <span class="navbar-toggler-icon"></span>
-    </button>
-    <div class="collapse navbar-collapse" id="navbarNav">
-      <ul class="navbar-nav">
-        <li class="nav-item"><a class="nav-link" href="/">Home</a></li>
-        <li class="nav-item"><a class="nav-link" href="/admin">Admin</a></li>
-        <li class="nav-item"><a class="nav-link" href="/emergency">Emergency</a></li>
-        <li class="nav-item"><a class="nav-link" href="/load_data">Load Data</a></li>
-      </ul>
-    </div>
-  </div>
-</nav>
-<div class="container">
-  {body}
-</div>
-</body>
-</html>
-"""
-        return html.encode('utf-8')
-
-    def _serve_home(self):
-        """Serve the home page with sign‑in/out forms."""
-        # Build options for staff and clients
-        staff_options = ''.join([f'<option value="staff|{sid}">{rec.get("name", "")}</option>' for sid, rec in DATA['staff'].items()])
-        client_options = ''.join([f'<option value="client|{cid}">{rec.get("name", "")}</option>' for cid, rec in DATA['clients'].items()])
-        body = f"""
-<div class="row">
-  <div class="col-md-6">
-    <h2>Staff Sign In/Out</h2>
-    <form method="post" action="/sign_action">
-      <div class="mb-3">
-        <label for="staff_select" class="form-label">Select staff member</label>
-        <select class="form-select" id="staff_select" name="person" required>
-          <option value="">-- Choose staff --</option>
-          {staff_options}
-        </select>
-      </div>
-      <div class="mb-3">
-        <label class="form-label">Action</label><br>
-        <div class="form-check form-check-inline">
-          <input class="form-check-input" type="radio" name="action" id="staff_in" value="sign_in" checked>
-          <label class="form-check-label" for="staff_in">Sign In</label>
-        </div>
-        <div class="form-check form-check-inline">
-          <input class="form-check-input" type="radio" name="action" id="staff_out" value="sign_out">
-          <label class="form-check-label" for="staff_out">Sign Out</label>
-        </div>
-      </div>
-      <div class="mb-3">
-        <label for="staff_site" class="form-label">Site</label>
-        <input type="text" class="form-control" id="staff_site" name="site" placeholder="e.g. Fort Wayne" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Submit</button>
-    </form>
-  </div>
-  <div class="col-md-6">
-    <h2>Client Sign In/Out</h2>
-    <form method="post" action="/sign_action">
-      <div class="mb-3">
-        <label for="client_select" class="form-label">Select client</label>
-        <select class="form-select" id="client_select" name="person" required>
-          <option value="">-- Choose client --</option>
-          {client_options}
-        </select>
-      </div>
-      <div class="mb-3">
-        <label class="form-label">Action</label><br>
-        <div class="form-check form-check-inline">
-          <input class="form-check-input" type="radio" name="action" id="client_in" value="sign_in" checked>
-          <label class="form-check-label" for="client_in">Sign In</label>
-        </div>
-        <div class="form-check form-check-inline">
-          <input class="form-check-input" type="radio" name="action" id="client_out" value="sign_out">
-          <label class="form-check-label" for="client_out">Sign Out</label>
-        </div>
-      </div>
-      <div class="mb-3">
-        <label for="client_site" class="form-label">Site</label>
-        <input type="text" class="form-control" id="client_site" name="site" placeholder="e.g. Fort Wayne" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Submit</button>
-    </form>
-  </div>
-</div>
-"""
-        self._send_response(self._html_template('Home - ABA Sign In', body))
-
-    def _handle_sign_action(self):
-        """Process a sign‑in or sign‑out form submission."""
-        ctype, pdict = cgi.parse_header(self.headers.get('Content-Type'))
-        if ctype == 'multipart/form-data':
-            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={'REQUEST_METHOD': 'POST'})
-        else:
-            length = int(self.headers.get('Content-Length', 0))
-            data = self.rfile.read(length).decode('utf-8')
-            form = parse_qs(data)
-        # Extract fields
-        person_field = form.get('person')
-        action_field = form.get('action')
-        site_field = form.get('site')
-        if isinstance(person_field, list):
-            person_field = person_field[0]
-        if isinstance(action_field, list):
-            action_field = action_field[0]
-        if isinstance(site_field, list):
-            site_field = site_field[0]
-        if isinstance(action_field, str):
-            action_field = action_field.strip()
-        if isinstance(site_field, str):
-            site_field = site_field.strip()
-        if not (person_field and action_field and site_field):
-            self._send_response(self._html_template('Error', '<p class="text-danger">Invalid form submission.</p>'))
-            return
-        # person_field is of the form "type|id"
-        try:
-            ptype, pid = person_field.split('|')
-        except ValueError:
-            self._send_response(self._html_template('Error', '<p class="text-danger">Invalid person selected.</p>'))
-            return
-        try:
-            event = _sign_in_service().record_action(
-                person_type=ptype,
-                person_id=pid,
-                action=action_field,
-                site=site_field,
-            )
-        except (KeyError, ValueError) as exc:
-            message = html.escape(str(exc))
-            body = f'<div class="alert alert-danger" role="alert">{message}</div><a href="/" class="btn btn-secondary">Return to Home</a>'
-            self._send_response(self._html_template('Error', body))
-            return
-        # Response
-        message = (
-            f"Successfully recorded {event['action'].replace('_', ' ').title()} for {html.escape(event['name'])} at {event['timestamp']}"
-        )
-        body = (
-            f'<div class="alert alert-success" role="alert">{message}</div><a href="/" class="btn btn-primary">Return to Home</a>'
-        )
-        self._send_response(self._html_template('Submission Received', body))
-
-    def _serve_admin(self):
-        """Serve the admin dashboard with sign‑in history and schedule comparison."""
-        today = datetime.date.today().isoformat()
-        rows = REPORTING_SERVICE.build_schedule_matrix(today)
-        table_rows = ''.join(
-            [
-                f"<tr><td>{row['person_type']}</td><td>{row['name']}</td><td>{row['start_time']}</td>"
-                f"<td>{row['end_time']}</td><td>{row['site']}</td><td>{row['status']}</td><td>{row['sign_time']}</td></tr>"
-                for row in rows
-            ]
-        )
-        # Build sign-in history table rows separately to avoid quoting issues in f-string
-        history_entries = []
-        for rec in DATA['signins'][-20:][::-1]:
-            # Format action string by replacing underscores
-            action_str = rec['action'].replace('_', ' ').title()
-            history_entries.append(
-                f"<tr><td>{rec['timestamp']}</td><td>{rec['person_type'].title()}</td><td>{rec['name']}</td><td>{rec['site']}</td><td>{action_str}</td></tr>"
-            )
-        history_rows = ''.join(history_entries)
-        body = f"""
-<h2>Admin Dashboard</h2>
-<p>Today is {today}</p>
-<h3>Schedule vs Attendance</h3>
-<table class="table table-striped">
-  <thead>
-    <tr><th>Type</th><th>Name</th><th>Start</th><th>End</th><th>Site</th><th>Status</th><th>Sign Time</th></tr>
-  </thead>
-  <tbody>
-    {table_rows}
-  </tbody>
-</table>
-<h3>Sign‑In History (latest 20 entries)</h3>
-<table class="table table-bordered">
-  <thead>
-    <tr><th>Timestamp</th><th>Type</th><th>Name</th><th>Site</th><th>Action</th></tr>
-  </thead>
-  <tbody>
-            {history_rows}
-  </tbody>
-</table>
-"""
-        self._send_response(self._html_template('Admin Dashboard', body))
-
-    def _serve_emergency(self):
-        """Serve the emergency page showing who's on site and who is missing."""
-        status = build_emergency_status()
-        present_rows = ''.join([
-            '<tr>'
-            f"<td>{html.escape(person.get('person_type', ''))}</td>"
-            f"<td>{html.escape(person.get('name', ''))}</td>"
-            f"<td>{html.escape(person.get('site', ''))}</td>"
-            f"<td>{html.escape(person.get('timestamp', ''))}</td>"
-            '</tr>'
-            for person in status['present']
-        ])
-        missing_rows = ''.join([
-            '<tr>'
-            f"<td>{html.escape(person.get('person_type', ''))}</td>"
-            f"<td>{html.escape(person.get('name', ''))}</td>"
-            f"<td>{html.escape(person.get('site', ''))}</td>"
-            f"<td>{html.escape(person.get('contact_name', ''))}</td>"
-            f"<td>{html.escape(person.get('contact_phone', ''))}</td>"
-            '</tr>'
-            for person in status['missing']
-        ])
-        if SETTINGS.get('teams_webhook_url'):
-            preview_markdown = format_emergency_markdown(status)
-            preview_html = html.escape(preview_markdown).replace('\n', '<br>')
-            teams_notice = (
-                "<form method=\"post\" action=\"/notify_teams\">"
-                "  <button type=\"submit\" class=\"btn btn-warning mb-3\">Send Teams Emergency Notification</button>"
-                "</form>"
-                "<p class=\"text-muted\">A notification will be posted to the configured Microsoft Teams channel.</p>"
-                "<details class=\"mb-3\">"
-                "  <summary>Preview Teams message</summary>"
-                f"  <div class=\"mt-2 p-3 bg-white border rounded\">{preview_html}</div>"
-                "</details>"
-            )
-        else:
-            teams_notice = (
-                "<div class=\"alert alert-info\" role=\"alert\">"
-                "Configure a Microsoft Teams webhook on the Load Data page to enable emergency notifications."
-                "</div>"
-            )
-        button = (
-            '<a class="btn btn-success mb-3" href="/firedrill_report">Complete Fire Drill Report</a>'
-            if status['present'] or status['missing']
-            else ''
-        )
-        body = f"""
-<h2>Emergency Roll Call</h2>
-<p>Report for {status['date']}</p>
-{teams_notice}
-{button}
-<h3>Present on Site</h3>
-<table class="table table-success table-bordered">
-  <thead><tr><th>Type</th><th>Name</th><th>Site</th><th>Signed In At</th></tr></thead>
-  <tbody>
-    {present_rows or '<tr><td colspan="4">No one is currently signed in according to records.</td></tr>'}
-  </tbody>
-</table>
-<h3>Scheduled but Missing</h3>
-<table class="table table-danger table-bordered">
-  <thead><tr><th>Type</th><th>Name</th><th>Expected Site</th><th>Contact Name</th><th>Contact Phone</th></tr></thead>
-  <tbody>
-    {missing_rows or '<tr><td colspan="5">No one is missing according to schedule.</td></tr>'}
-  </tbody>
-</table>
-"""
-        self._send_response(self._html_template('Emergency Roll Call', body))
-
-    def _reason_field_name(self, person: dict) -> str:
-        person_type = person.get('person_type', '').lower().replace(' ', '_')
-        identifier = person.get('person_id', '')
-        return f"reason_{person_type}_{identifier}"
-
-    def _serve_firedrill_report_form(self):
-        status = build_emergency_status()
-        now = datetime.datetime.now()
-        default_timestamp = now.strftime('%Y-%m-%dT%H:%M')
-        missing_sections = []
-        for person in status['missing']:
-            field_name = self._reason_field_name(person)
-            options = ['<option value="">-- Select reason --</option>'] + [
-                f"<option value=\"{html.escape(reason)}\">{html.escape(reason)}</option>"
-                for reason in FIRE_DRILL_REASON_OPTIONS
-            ]
-            missing_sections.append(
-                "<div class=\"mb-3\">"
-                f"  <label class=\"form-label\" for=\"{field_name}\">"
-                f"{html.escape(person.get('person_type', ''))} - {html.escape(person.get('name', ''))} ({html.escape(person.get('site', '')) or 'No site'})"
-                "</label>"
-                f"  <select class=\"form-select\" id=\"{field_name}\" name=\"{field_name}\" required>"
-                f"    {' '.join(options)}"
-                "  </select>"
-                "</div>"
-            )
-        missing_html = ''.join(missing_sections) or '<p class="text-muted">All individuals accounted for.</p>'
-        present_html = ''.join(
-            [
-                '<li class="list-group-item">'
-                f"<strong>{html.escape(person.get('person_type', ''))}</strong>: {html.escape(person.get('name', ''))}"
-                f" &mdash; {html.escape(person.get('site', ''))}"
-                f" <span class=\"text-muted\">(since {html.escape(person.get('timestamp', ''))})</span>"
-                '</li>'
-                for person in status['present']
-            ]
-        ) or '<li class="list-group-item text-muted">No one is signed in.</li>'
-        body = f"""
-<h2>Fire Drill Report</h2>
-<p>Use this form to document the outcome of the most recent fire drill.</p>
-<form method="post" action="/firedrill_report">
-  <div class="row">
-    <div class="col-md-6">
-      <div class="mb-3">
-        <label class="form-label" for="drill_datetime">Fire drill date &amp; time</label>
-        <input type="datetime-local" class="form-control" id="drill_datetime" name="drill_datetime" value="{default_timestamp}" required>
-      </div>
-    </div>
-    <div class="col-md-6">
-      <div class="mb-3">
-        <label class="form-label" for="drill_location">Location</label>
-        <input type="text" class="form-control" id="drill_location" name="location" placeholder="e.g. Fort Wayne" required>
-      </div>
-    </div>
-  </div>
-  <div class="mb-4">
-    <h3>Accounted For</h3>
-    <ul class="list-group">
-      {present_html}
-    </ul>
-  </div>
-  <div class="mb-4">
-    <h3>Not Accounted For</h3>
-    {missing_html}
-  </div>
-  <button type="submit" class="btn btn-primary">Export Fire Drill Report</button>
-</form>
-"""
-        self._send_response(self._html_template('Fire Drill Report', body))
-
-    def _handle_firedrill_report_submission(self):
-        status = build_emergency_status()
-        length = int(self.headers.get('Content-Length', 0))
-        payload = self.rfile.read(length).decode('utf-8') if length else ''
-        params = parse_qs(payload)
-        location = params.get('location', [''])[0].strip()
-        drill_dt_raw = params.get('drill_datetime', [''])[0].strip()
-        if not location or not drill_dt_raw:
-            body = '<p class="text-danger">Fire drill date/time and location are required.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
-            self._send_response(self._html_template('Fire Drill Report Error', body))
-            return
-        try:
-            drill_dt = datetime.datetime.fromisoformat(drill_dt_raw)
-        except ValueError:
-            body = '<p class="text-danger">Invalid date/time provided.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
-            self._send_response(self._html_template('Fire Drill Report Error', body))
-            return
-        reasons = {}
-        for person in status['missing']:
-            field = self._reason_field_name(person)
-            reason = params.get(field, [''])[0].strip()
-            if status['missing'] and not reason:
-                body = '<p class="text-danger">Please select a reason for each individual who was not accounted for.</p><a href="/firedrill_report" class="btn btn-secondary">Back</a>'
-                self._send_response(self._html_template('Fire Drill Report Error', body))
-                return
-            reasons[(person.get('person_type'), person.get('person_id'))] = reason
-
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(['Fire Drill Report'])
-        writer.writerow(['Generated At', datetime.datetime.now().isoformat(timespec='seconds')])
-        writer.writerow(['Fire Drill Date/Time', drill_dt.isoformat(timespec='minutes')])
-        writer.writerow(['Location', location])
-        writer.writerow([])
-        writer.writerow(['Person Type', 'Name', 'Site', 'Status', 'Details'])
-        for person in status['present']:
-            details = person.get('timestamp', '')
-            detail_text = f"Signed in at {details}" if details else ''
-            writer.writerow([
-                person.get('person_type', ''),
-                person.get('name', ''),
-                person.get('site', ''),
-                'Accounted For',
-                detail_text,
-            ])
-        for person in status['missing']:
-            key = (person.get('person_type'), person.get('person_id'))
-            reason = reasons.get(key, 'Reason not provided')
-            writer.writerow([
-                person.get('person_type', ''),
-                person.get('name', ''),
-                person.get('site', ''),
-                'Not Accounted For',
-                reason,
-            ])
-
-        csv_data = output.getvalue().encode('utf-8')
-        safe_location = ''.join(ch if ch.isalnum() or ch in ('-', '_') else '_' for ch in location.strip()) or 'location'
-        timestamp_component = drill_dt.strftime('%Y%m%d-%H%M')
-        filename = f"firedrill_{timestamp_component}_{safe_location}.csv"
-        self.send_response(HTTPStatus.OK)
-        self.send_header('Content-Type', 'text/csv; charset=utf-8')
-        self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
-        self.send_header('Content-Length', str(len(csv_data)))
-        self.end_headers()
-        self.wfile.write(csv_data)
-
-    def _serve_load_data_page(self):
-        """Serve the page for uploading CSV files."""
-        webhook_status = 'Configured' if SETTINGS.get('teams_webhook_url') else 'Not Configured'
-        webhook_hint = (
-            f"<span class=\"badge bg-success\">{webhook_status}</span>"
-            if SETTINGS.get('teams_webhook_url')
-            else f"<span class=\"badge bg-secondary\">{webhook_status}</span>"
-        )
-        body = f"""
-<h2>Load Data</h2>
-<p>Use this page to upload CSV files for staff, clients, and schedules. The server will overwrite existing data in memory.</p>
-<div class="row">
-  <div class="col-md-4">
-    <h4>Upload Staff CSV</h4>
-    <form method="post" action="/upload_csv" enctype="multipart/form-data">
-      <input type="hidden" name="category" value="staff">
-      <div class="mb-3">
-        <input class="form-control" type="file" name="file" accept=".csv" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Upload Staff</button>
-    </form>
-  </div>
-  <div class="col-md-4">
-    <h4>Upload Clients CSV</h4>
-    <form method="post" action="/upload_csv" enctype="multipart/form-data">
-      <input type="hidden" name="category" value="clients">
-      <div class="mb-3">
-        <input class="form-control" type="file" name="file" accept=".csv" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Upload Clients</button>
-    </form>
-  </div>
-  <div class="col-md-4">
-    <h4>Upload Schedule CSV</h4>
-    <form method="post" action="/upload_csv" enctype="multipart/form-data">
-      <input type="hidden" name="category" value="schedule">
-      <div class="mb-3">
-        <input class="form-control" type="file" name="file" accept=".csv" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Upload Schedule</button>
-    </form>
-  </div>
-</div>
-<hr>
-<div class="row">
-  <div class="col-md-6">
-    <h4>Microsoft Teams Emergency Notifications {webhook_hint}</h4>
-    <p>Provide an incoming webhook URL from your Microsoft Teams channel to enable one-click emergency notifications.</p>
-    <form method="post" action="/configure_teams">
-      <div class="mb-3">
-        <label for="teams_webhook" class="form-label">Teams Webhook URL</label>
-        <input type="url" class="form-control" id="teams_webhook" name="webhook" placeholder="https://..." value="{SETTINGS.get('teams_webhook_url', '')}" required>
-      </div>
-      <button type="submit" class="btn btn-primary">Save Webhook</button>
-    </form>
-    <p class="mt-2 text-muted">The URL is stored on this server only and used when sending an emergency notification.</p>
-  </div>
-</div>
-"""
-        self._send_response(self._html_template('Load Data', body))
-
-    def _handle_upload_csv(self):
-        """Handle CSV uploads for staff, clients, and schedule."""
-        # Parse the incoming form data. Use cgi.FieldStorage to support file upload.
-        environ = {
-            'REQUEST_METHOD': 'POST',
-            'CONTENT_TYPE': self.headers.get('Content-Type', ''),
-        }
-        content_length = self.headers.get('Content-Length')
-        if content_length is not None:
-            environ['CONTENT_LENGTH'] = content_length
-        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=environ)
-        category = form.getvalue('category')
-        fileitem = form['file'] if 'file' in form else None
-        if (
-            category not in ('staff', 'clients', 'schedule')
-            or fileitem is None
-            or getattr(fileitem, 'file', None) is None
-        ):
-            self._send_response(self._html_template('Error', '<p class="text-danger">Invalid upload request.</p>'))
-            return
-        # Save the uploaded file to a temporary location
-        upload_path = os.path.join(RUNTIME_DIR, f'tmp_upload_{category}.csv')
-        with open(upload_path, 'wb') as fout:
-            while True:
-                chunk = fileitem.file.read(8192)
-                if not chunk:
-                    break
-                fout.write(chunk)
-        # Load into memory
-        try:
-            if category in ('staff', 'clients'):
-                load_csv(upload_path, category)
-            else:
-                load_schedule_csv(upload_path)
-        except Exception as e:
-            body = f'<p class="text-danger">Error processing CSV: {e}</p>'
-            self._send_response(self._html_template('Upload Error', body))
-            return
-        body = f'<div class="alert alert-success" role="alert">Successfully loaded {category} data.</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
-        self._send_response(self._html_template('Upload Successful', body))
-
-    def _handle_configure_teams(self):
-        """Store the Microsoft Teams webhook URL provided by the admin."""
-        length = int(self.headers.get('Content-Length', 0))
-        payload = self.rfile.read(length).decode('utf-8') if length else ''
-        params = parse_qs(payload)
-        webhook = params.get('webhook', [''])[0].strip()
-        if not webhook:
-            body = '<p class="text-danger">No webhook URL provided.</p><a href="/load_data" class="btn btn-secondary">Back</a>'
-            self._send_response(self._html_template('Teams Configuration Error', body))
-            return
-        if not webhook.lower().startswith('https://'):
-            body = '<p class="text-danger">Webhook URLs must start with https://</p><a href="/load_data" class="btn btn-secondary">Back</a>'
-            self._send_response(self._html_template('Teams Configuration Error', body))
-            return
-        SETTINGS['teams_webhook_url'] = webhook
-        save_settings()
-        body = '<div class="alert alert-success" role="alert">Microsoft Teams webhook saved.</div><a href="/load_data" class="btn btn-primary">Back to Load Data</a>'
-        self._send_response(self._html_template('Teams Configuration Saved', body))
-
-    def _handle_notify_teams(self):
-        """Send an emergency notification to Microsoft Teams."""
-        webhook = SETTINGS.get('teams_webhook_url', '').strip()
-        if not webhook:
-            body = '<p class="text-danger">No Microsoft Teams webhook configured.</p><a href="/emergency" class="btn btn-secondary">Back</a>'
-            self._send_response(self._html_template('Notification Error', body))
-            return
-        status = build_emergency_status()
-        success, message = send_teams_notification(webhook, status)
-        if not success:
-            body = f'<p class="text-danger">{message}</p><a href="/emergency" class="btn btn-secondary">Back to Emergency</a>'
-            self._send_response(self._html_template('Notification Error', body))
-            return
-        body = f'<div class="alert alert-success" role="alert">{message}</div><a href="/emergency" class="btn btn-primary">Back to Emergency</a>'
-        self._send_response(self._html_template('Notification Sent', body))
-
+    def log_message(self, format: str, *args) -> None:  # pragma: no cover - silence default logging
+        pass
 
 def _initial_data_paths(filename: str):
     """Yield potential CSV locations for bundled starter data."""
