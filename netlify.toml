@@ -1,2 +1,10 @@
+[build]
+  publish = "."
+
 [build.environment]
   NETLIFY_IMAGE_VERSION = "jammy"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
