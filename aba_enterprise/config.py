@@ -81,7 +81,24 @@ def load_app_config(base_dir: Optional[str] = None) -> AppConfig:
     """
 
     base_path = Path(base_dir) if base_dir else Path(__file__).resolve().parent.parent
-    runtime_root = Path(os.environ.get("ABA_RUNTIME_DIR", base_path / "runtime"))
+    runtime_dir_env = os.environ.get("ABA_RUNTIME_DIR")
+    if runtime_dir_env:
+        runtime_root = Path(runtime_dir_env)
+    else:
+        # Default to a "runtime" directory within the project, but fall back to
+        # a writable temporary directory (such as /tmp on serverless platforms)
+        # when the project path is read-only. Netlify functions, for example,
+        # execute from a read-only bundle so the application must store its
+        # snapshots and settings elsewhere.
+        candidate = Path(base_path / "runtime")
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            tmp_root = Path(os.environ.get("TMPDIR", "/tmp"))
+            runtime_root = tmp_root / "aba_sign_in_runtime"
+            runtime_root.mkdir(parents=True, exist_ok=True)
+        else:
+            runtime_root = candidate
     runtime_root.mkdir(parents=True, exist_ok=True)
 
     environment = os.environ.get("ABA_ENVIRONMENT", "development")
